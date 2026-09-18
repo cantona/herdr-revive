@@ -1,0 +1,7 @@
+/target/
+/benchmark-results/
+/.agents/
+/.codex/
+/.local/
+*.tmp
+__pycache__/

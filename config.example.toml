@@ -1,0 +1,29 @@
+# Copy to HERDR_PLUGIN_CONFIG_DIR/config.toml. Unknown keys are errors.
+# For automatic agent restore, disable session.resume_agents_on_restore in
+# Herdr's main config.toml so its canonical agent launches cannot race Revive.
+auto_restore = false
+auto_save = false
+debounce_ms = 5000
+settle_ms = 2500
+timeout_ms = 3000
+retention = 10
+interval_seconds = 900
+transport = "direct"
+# Exact executable strings by default; [] denies all command launches.
+# Explicit "*" trusts every executable. Interpreters are not sandboxed.
+allowed_programs = []
+match_program_basename = false
+resume_agents = true
+
+# Optional reviewed arguments, added after the exact saved resume ID.
+# Session selectors, prompts, unknown flags and missing values are rejected.
+[agent_extra_args]
+# claude = ["--model", "sonnet"]
+# codex = ["--sandbox", "workspace-write"]
+
+# Exec-style wrappers require a distinguishing nonsecret environment value.
+# Add the wrapper to allowed_programs and use the actual absolute config path.
+# [[agent_launchers]]
+# agent = "claude"
+# executable = "claude-local"
+# match_env = { CLAUDE_CONFIG_DIR = "/home/you/.claude-local" }

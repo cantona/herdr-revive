@@ -1,0 +1,154 @@
+id = "cantona.herdr-revive"
+name = "herdr-revive"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Save and restore sessions, reusable workspace layouts, and exact agent sessions"
+platforms = ["linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[startup]]
+command = ["target/release/herdr-revive", "event"]
+
+[[panes]]
+id = "manage"
+title = "herdr-revive"
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["sh", "scripts/manage.sh"]
+
+[[actions]]
+id = "manage"
+title = "Manage saved sessions and spaces"
+contexts = ["workspace"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint manage"]
+
+[[actions]]
+id = "save"
+title = "Save session snapshot"
+contexts = ["workspace"]
+command = ["target/release/herdr-revive", "save"]
+
+[[actions]]
+id = "preview"
+title = "Preview session restore"
+contexts = ["workspace"]
+command = ["target/release/herdr-revive", "preview"]
+
+[[actions]]
+id = "restore"
+title = "Restore session snapshot"
+contexts = ["workspace"]
+command = ["target/release/herdr-revive", "restore"]
+
+[[actions]]
+id = "autosave"
+title = "Run configured autosave"
+contexts = ["workspace"]
+command = ["target/release/herdr-revive", "autosave"]
+
+[[actions]]
+id = "list"
+title = "List saved sessions"
+contexts = ["workspace"]
+command = ["target/release/herdr-revive", "list"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["target/release/herdr-revive", "event"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["target/release/herdr-revive", "event"]
+
+[[events]]
+on = "pane.exited"
+command = ["target/release/herdr-revive", "event"]
+
+[[events]]
+on = "workspace.created"
+command = ["target/release/herdr-revive", "event"]
+
+[[events]]
+on = "tab.created"
+command = ["target/release/herdr-revive", "event"]
+
+[[panes]]
+id = "save-space"
+title = "Save this workspace as a named space"
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["sh", "scripts/manage.sh", "save-space"]
+
+[[actions]]
+id = "save-space"
+title = "Save this workspace as a named space"
+contexts = ["workspace"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint save-space"]
+
+[[panes]]
+id = "open-space"
+title = "Open a saved space"
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["sh", "scripts/manage.sh", "open-space"]
+
+[[actions]]
+id = "open-space"
+title = "Open a saved space"
+contexts = ["workspace"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint open-space"]
+
+[[panes]]
+id = "delete-space"
+title = "Delete a saved space"
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["sh", "scripts/manage.sh", "delete-space"]
+
+[[actions]]
+id = "delete-space"
+title = "Delete a saved space"
+contexts = ["workspace"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint delete-space"]
+
+[[panes]]
+id = "autosave"
+title = "herdr-revive periodic autosave"
+placement = "split"
+command = ["target/release/herdr-revive", "timer"]
+
+[[actions]]
+id = "timer"
+title = "Start periodic autosave pane"
+contexts = ["workspace"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint autosave"]
+
+[[events]]
+on = "workspace.closed"
+command = ["target/release/herdr-revive", "event"]
+
+[[events]]
+on = "workspace.renamed"
+command = ["target/release/herdr-revive", "event"]
+
+[[events]]
+on = "tab.closed"
+command = ["target/release/herdr-revive", "event"]
+
+[[events]]
+on = "tab.renamed"
+command = ["target/release/herdr-revive", "event"]
+
+[[events]]
+on = "pane.created"
+command = ["target/release/herdr-revive", "event"]
+
+[[events]]
+on = "pane.closed"
+command = ["target/release/herdr-revive", "event"]
