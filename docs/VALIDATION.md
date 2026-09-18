@@ -44,6 +44,11 @@ initial Linux prerelease, not certification of every host, filesystem or interac
   directory, popup launcher exit, private link/enable/disable/relink/uninstall,
   preserved config and state, and refusal of a manifest requiring a future host.
   These lifecycle tests used disposable directories and a disposable server.
+- Actual GitHub installation of the reviewed source: missing Cargo and a failed
+  build refused registration; a failed reinstall preserved registration;
+  successful install/reinstall/uninstall preserved external configuration and
+  state. The installed binary and manager ran from the managed checkout.
+  All paths were under temporary roots; normal registration was unchanged.
 - Dependency metadata/license inventory for all 57 Linux dependency packages,
   with upstream license/notice texts preserved. The lock contains additional
   target-specific packages not validated for a non-Linux release.

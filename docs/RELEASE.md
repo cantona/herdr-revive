@@ -43,6 +43,9 @@ cold-start measurements and other platforms remain follow-up qualification.
 The whole-repository adversarial source review returned NO FINDINGS. Formatting,
 Clippy, the locked build, runtime suites and benchmark parser checks passed.
 The annotator MCP was unavailable for the separate interactive diff checkpoint.
+The actual GitHub installer passed successful build, missing-Cargo, failed-build,
+reinstall and uninstall checks in temporary roots. External config/state survived
+reinstall and uninstall; a failed reinstall preserved the existing registration.
 
 Public discovery follows the [official marketplace rules](https://herdr.dev/docs/marketplace/):
 a non-fork, non-archived public GitHub repository, a parseable root manifest, and
