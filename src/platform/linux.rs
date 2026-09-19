@@ -250,21 +250,58 @@ pub fn git_pager_stdio(table: &HashMap<u32, Process>, git: &Process, shell: u32)
         .filter(|child| child.parent == git.pid)
         .collect();
     ensure!(children.len() == 1, "Git pager child is ambiguous");
-    let pager = children[0];
+    let direct_child = children[0];
+    ensure!(
+        direct_child.group == git.group && process(direct_child.pid)? == *direct_child,
+        "Git pager identity changed"
+    );
+    let is_system_executable = |candidate: &Process, paths: &[&str]| -> Result<bool> {
+        let executable = std::fs::metadata(format!("/proc/{}/exe", candidate.pid))?;
+        let mut supported = false;
+        for path in paths {
+            match std::fs::metadata(path) {
+                Ok(native) => supported |= same_file(&executable, &native),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(supported)
+    };
+    let pager_paths = ["/usr/bin/less", "/usr/bin/more"];
+    let mut wrapper = None;
+    let pager = if is_system_executable(direct_child, &pager_paths)? {
+        direct_child
+    } else if is_system_executable(direct_child, &["/bin/sh"])? {
+        let pager_children: Vec<_> = table
+            .values()
+            .filter(|child| child.parent == direct_child.pid)
+            .collect();
+        ensure!(pager_children.len() == 1, "Git pager wrapper is ambiguous");
+        wrapper = Some(direct_child);
+        pager_children[0]
+    } else {
+        anyhow::bail!("Git pager is not system less or more");
+    };
     ensure!(
         pager.group == git.group && process(pager.pid)? == *pager,
         "Git pager identity changed"
     );
-    let executable = std::fs::metadata(format!("/proc/{}/exe", pager.pid))?;
-    let mut supported = false;
-    for path in ["/usr/bin/less", "/usr/bin/more"] {
-        match std::fs::metadata(path) {
-            Ok(native) => supported |= same_file(&executable, &native),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+    ensure!(
+        is_system_executable(pager, &pager_paths)?,
+        "Git pager is not system less or more"
+    );
+    if let Some(wrapper) = wrapper {
+        let (argv, _) = argv_and_cwd(wrapper)?;
+        let (pager_argv, _) = argv_and_cwd(pager)?;
+        let script = argv.get(2).context("Git pager wrapper has no command")?;
+        ensure!(
+            argv.first()
+                .is_some_and(|arg| Path::new(arg).file_name().is_some_and(|name| name == "sh"))
+                && argv.get(1).is_some_and(|arg| arg == "-c")
+                && super::plain_shell_command_matches(script, &pager_argv),
+            "Git pager wrapper is not a system shell command"
+        );
     }
-    ensure!(supported, "Git pager is not system less or more");
     let pipe = descriptor(pager.pid, 0)?;
     ensure!(pipe.file_type().is_fifo(), "Git pager input is not a pipe");
     ensure!(
@@ -312,7 +349,14 @@ pub fn git_pager_stdio(table: &HashMap<u32, Process>, git: &Process, shell: u32)
         Err(error) => return Err(error.into()),
     }
     ensure!(
-        process(git.pid)? == *git && process(pager.pid)? == *pager,
+        process(git.pid)? == *git,
+        "Git process changed during capture"
+    );
+    ensure!(
+        process(pager.pid)? == *pager
+            && wrapper.is_none_or(|wrapper| {
+                process(wrapper.pid).is_ok_and(|current| current == *wrapper)
+            }),
         "Git pager process changed during capture"
     );
     Ok(())

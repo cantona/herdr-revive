@@ -182,9 +182,11 @@ back to `--continue`, latest-session lookup, or filesystem/cwd heuristics.
 
 Process-group members must descend from one foreground leader. Pipelines,
 redirected stdin and output redirections other than `/dev/null` are rejected.
-Agent stream redirections remain unsupported. Git with a direct system less/more
-pager may use its internal pipe: terminal and pipe identities are checked, and
-the original Git argv is saved. Once Git closes both output pipe writers,
+Observed agent stdout/stderr redirections to `/dev/null` are preserved exactly.
+Git with a system less/more pager,
+either direct or through Git's single system-shell wrapper, may use its internal
+pipe: terminal and pipe identities are checked, and the original Git argv is
+saved. Once Git closes both output pipe writers,
 capture also requires its retained terminal descriptors; redirected pager output
 and external shell pipelines remain refused. Keeping stdin attached also
 preserves the PTY lifetime during native reconstruction. Process identity checks

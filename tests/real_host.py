@@ -149,12 +149,13 @@ class RealHost(unittest.TestCase):
                         "commit", "-q", "--allow-empty", "-m", "revive pager fixture"], check=True)
         created = self.api("workspace.create", dict(label="Git pager", cwd=str(self.root), focus=False))
         pane = created["root_pane"]["pane_id"]
-        # Plain less stays open even with one line; no shell wrapper in core.pager.
-        argv = ["git", "-c", "core.pager=less", "log", "--oneline"]
+        # A pager command with arguments makes Git use a system-shell wrapper.
+        argv = ["git", "log", "--oneline"]
         if sys.platform == "darwin":
             argv[0] = subprocess.check_output(["/usr/bin/xcrun", "--find", "git"], text=True).strip()
         import shlex
-        self.api("pane.send_input", dict(pane_id=pane, text="GIT_PAGER=less LESS= "+shlex.join(argv), keys=["Enter"]))
+        self.api("pane.send_input", dict(
+            pane_id=pane, text="GIT_PAGER='less -R' LESS=-R "+shlex.join(argv), keys=["Enter"]))
 
         def wait_process(name):
             deadline = time.monotonic() + 5
@@ -166,9 +167,20 @@ class RealHost(unittest.TestCase):
             self.fail(f"{name} did not start: {info}")
 
         wait_process("less")
+        if sys.platform != "darwin":
+            wait_process("sh")
         path = Path(self.run_cli("save")["result"]["path"])
         command = json.loads(path.read_text())["panes"][0]["command"]
         self.assertEqual(command, dict(kind="program", argv=argv))
+        self.api("pane.send_input", dict(pane_id=pane, text="q"))
+        wait_process("bash")
+        self.api("pane.send_input", dict(
+            pane_id=pane, text="GIT_PAGER='less -R; true' LESS=-R "+shlex.join(argv), keys=["Enter"]))
+        wait_process("less")
+        wait_process("bash" if sys.platform == "darwin" else "sh")
+        before = path.read_bytes()
+        self.run_cli("save", ok=False)
+        self.assertEqual(path.read_bytes(), before)
         self.api("pane.send_input", dict(pane_id=pane, text="q"))
         wait_process("bash")
         # LESS belongs to the user environment and must be present at relaunch too.
@@ -375,7 +387,11 @@ class RealHost(unittest.TestCase):
 
     def test_restart_preserves_custom_agent_launcher_without_native_resume(self):
         source = self.root / "agent.c"
-        source.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
+        source.write_text(
+            '#include <fcntl.h>\n#include <unistd.h>\n'
+            'int main(void) { int fd = open("/dev/null", O_WRONLY); '
+            'if (fd < 0 || dup2(fd, 2) < 0) return 1; if (fd != 2) close(fd); '
+            'for (;;) pause(); }\n')
         bindir = self.root / "bin"
         bindir.mkdir()
         subprocess.run(["cc", str(source), "-o", str(bindir / "claude")], check=True)
@@ -393,14 +409,17 @@ class RealHost(unittest.TestCase):
         self.api("pane.send_input", dict(pane_id=pane, text=f"{wrapper} --resume {session}", keys=["Enter"]))
         deadline = time.monotonic() + 5
         while True:
-            live = next(p for p in self.api("session.snapshot")["snapshot"]["panes"] if p["pane_id"] == pane)
-            if live.get("agent") == "claude":
+            info = self.api("pane.process_info", dict(pane_id=pane))["process_info"]
+            processes = info["foreground_processes"]
+            if processes and fd_target(processes[0]["pid"], 2) == "/dev/null":
                 break
-            self.assertLess(time.monotonic(), deadline, live)
+            self.assertLess(time.monotonic(), deadline, info)
             time.sleep(0.05)
         self.api("pane.report_agent_session", dict(pane_id=pane, source="herdr:claude", agent="claude", agent_session_id=session))
         saved = Path(self.run_cli("save")["result"]["path"])
-        self.assertEqual(json.loads(saved.read_text())["panes"][0]["command"]["executable"], str(wrapper))
+        command = json.loads(saved.read_text())["panes"][0]["command"]
+        self.assertEqual(command["executable"], str(wrapper))
+        self.assertEqual(command["null_stdio"], [False, False, True])
         self.env["PATH"] = str(bindir) + ":" + self.env["PATH"]
         host_config = Path(self.env["HERDR_CONFIG_PATH"])
         host_config.write_text('[session]\nresume_agents_on_restore = true\n')
@@ -451,7 +470,9 @@ class RealHost(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, info)
             time.sleep(0.05)
         recaptured = Path(self.run_cli("save")["result"]["path"])
-        self.assertEqual(json.loads(recaptured.read_text())["panes"][0]["command"]["executable"], str(wrapper))
+        command = json.loads(recaptured.read_text())["panes"][0]["command"]
+        self.assertEqual(command["executable"], str(wrapper))
+        self.assertEqual(command["null_stdio"], [False, False, True])
         self.assertEqual(self.run_cli("event")["result"]["status"], "boot_done")
 
     def test_timer_periodic_and_final_save(self):

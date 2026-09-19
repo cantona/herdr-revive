@@ -55,6 +55,44 @@ fn null_output_wrapper_preserves_literal_arguments_and_checks_original_policy() 
         null_stdio: [true, false, false],
     };
     assert!(unsupported.argv().is_err());
+    let empty = CommandSpec::ProgramNullStdio {
+        argv: vec!["sleep".into(), "1".into()],
+        null_stdio: [false; 3],
+    };
+    assert!(empty.argv().is_err());
+}
+
+#[test]
+fn agent_null_output_is_preserved_without_breaking_legacy_snapshots() {
+    let id = "01234567-89ab-cdef-0123-456789abcdef";
+    let legacy =
+        format!(r#"{{"kind":"agent","executable":"codex","agent":"codex","session_id":"{id}"}}"#);
+    let legacy: CommandSpec = serde_json::from_str(&legacy).unwrap();
+    assert_eq!(
+        serde_json::to_value(&legacy).unwrap(),
+        serde_json::json!({
+            "kind": "agent", "executable": "codex", "agent": "codex", "session_id": id
+        })
+    );
+
+    let command = CommandSpec::Agent {
+        executable: "codex".into(),
+        agent: AgentKind::Codex,
+        session_id: id.into(),
+        null_stdio: [false, false, true],
+    };
+    assert_eq!(
+        command.allowed_argv(&config()).unwrap(),
+        [
+            "/bin/sh",
+            "-c",
+            "exec \"$@\" 2> /dev/null",
+            "herdr-revive",
+            "codex",
+            "resume",
+            id,
+        ]
+    );
 }
 
 #[test]
@@ -762,6 +800,7 @@ fn configurable_program_matching_and_safe_agent_options() {
         executable: "claude".into(),
         agent: AgentKind::Claude,
         session_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+        null_stdio: [false; 3],
     };
     assert_eq!(
         &command.allowed_argv(&cfg).unwrap()[3..],
@@ -841,6 +880,7 @@ fn custom_agent_launcher_is_selected_by_environment_and_current_policy() {
         executable: selected.executable.clone(),
         agent: AgentKind::Claude,
         session_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+        null_stdio: [false; 3],
     };
     assert_eq!(cmd.allowed_argv(&cfg).unwrap()[0], "claude-local");
     let plain = CommandSpec::Program {

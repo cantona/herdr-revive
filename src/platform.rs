@@ -71,6 +71,30 @@ pub fn decode_argv(bytes: &[u8]) -> Result<Vec<String>> {
     Ok(argv)
 }
 
+fn plain_shell_command_matches(script: &str, argv: &[String]) -> bool {
+    !script.is_empty()
+        && script.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b' ' | b'\t'
+                        | b'/'
+                        | b'.'
+                        | b'_'
+                        | b'-'
+                        | b'+'
+                        | b'='
+                        | b','
+                        | b':'
+                        | b'%'
+                        | b'@'
+                )
+        })
+        && script
+            .split_ascii_whitespace()
+            .eq(argv.iter().map(String::as_str))
+}
+
 pub fn idle_shell(info: &ProcessInfo) -> Result<Option<String>> {
     let pid = info.shell_pid.context("shell PID unavailable")?;
     if !is_shell_process(pid)? {
@@ -135,4 +159,18 @@ static IDENTITY_CONNECTIONS: std::sync::atomic::AtomicUsize =
 
 pub fn identity_connections() -> usize {
     IDENTITY_CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain_shell_command_matches;
+
+    #[test]
+    fn plain_shell_command_rejects_expansion_and_operators() {
+        let pager = vec!["less".into(), "-FRX".into()];
+        assert!(plain_shell_command_matches("less -FRX", &pager));
+        assert!(!plain_shell_command_matches("less -FRX; true", &pager));
+        assert!(!plain_shell_command_matches("less $PAGER_ARGS", &pager));
+        assert!(!plain_shell_command_matches("less -FRX | more", &pager));
+    }
 }

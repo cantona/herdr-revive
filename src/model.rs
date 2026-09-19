@@ -216,7 +216,13 @@ pub enum CommandSpec {
         executable: String,
         agent: AgentKind,
         session_id: String,
+        #[serde(default, skip_serializing_if = "null_stdio_is_empty")]
+        null_stdio: [bool; 3],
     },
+}
+
+fn null_stdio_is_empty(null_stdio: &[bool; 3]) -> bool {
+    !null_stdio.iter().any(|redirect| *redirect)
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -299,6 +305,7 @@ impl CommandSpec {
                 executable,
                 agent,
                 session_id,
+                ..
             } => {
                 validate_program(executable)?;
                 if let Some(known) = agent_launcher(std::slice::from_ref(executable)) {
@@ -320,12 +327,14 @@ impl CommandSpec {
             }
         };
         validate_argv(&argv)?;
-        if let Self::ProgramNullStdio { null_stdio, .. } = self {
+        if let Some(null_stdio) = self.null_stdio() {
             ensure!(!null_stdio[0], "redirected stdin is unsupported");
-            ensure!(
-                !is_ssh(&argv[0]),
-                "SSH output redirection cannot be restored; repair or recapture the snapshot"
-            );
+            if matches!(self, Self::ProgramNullStdio { .. }) {
+                ensure!(
+                    !is_ssh(&argv[0]),
+                    "SSH output redirection cannot be restored; repair or recapture the snapshot"
+                );
+            }
             ensure!(
                 null_stdio.iter().any(|value| *value),
                 "empty null-stdio specification"
@@ -364,7 +373,7 @@ impl CommandSpec {
             );
         }
         validate_argv(&argv)?;
-        if let Self::ProgramNullStdio { null_stdio, .. } = self {
+        if let Some(null_stdio) = self.null_stdio() {
             let mut script = String::from("exec \"$@\"");
             for (fd, redirect) in null_stdio.iter().enumerate() {
                 if *redirect {
@@ -380,6 +389,16 @@ impl CommandSpec {
             return Ok(launch);
         }
         Ok(argv)
+    }
+
+    fn null_stdio(&self) -> Option<&[bool; 3]> {
+        match self {
+            Self::ProgramNullStdio { null_stdio, .. } => Some(null_stdio),
+            Self::Agent { null_stdio, .. } if null_stdio.iter().any(|redirect| *redirect) => {
+                Some(null_stdio)
+            }
+            _ => None,
+        }
     }
 }
 

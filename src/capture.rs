@@ -111,7 +111,18 @@ pub fn capture(
                     Some(CommandSpec::Program { argv }) => {
                         Some(CommandSpec::ProgramNullStdio { argv, null_stdio })
                     }
-                    _ => anyhow::bail!("redirected agent streams are unsupported"),
+                    Some(CommandSpec::Agent {
+                        executable,
+                        agent,
+                        session_id,
+                        ..
+                    }) => Some(CommandSpec::Agent {
+                        executable,
+                        agent,
+                        session_id,
+                        null_stdio,
+                    }),
+                    _ => anyhow::bail!("redirected streams are unsupported"),
                 }
             } else {
                 command
@@ -198,6 +209,7 @@ pub fn command_for(argv: &[String], native: Option<&AgentSession>) -> Result<Opt
             },
             agent,
             session_id,
+            null_stdio: [false; 3],
         }));
     }
     // Never turn an unrelated foreground process into a stale stored agent session.

@@ -595,7 +595,27 @@ pub fn git_pager_stdio(table: &HashMap<u32, Process>, git: &Process, shell: u32)
     );
     let children: Vec<_> = table.values().filter(|p| p.parent == git.pid).collect();
     ensure!(children.len() == 1, "Git pager child is ambiguous");
-    let pager = children[0];
+    let direct_child = children[0];
+    ensure!(
+        direct_child.group == git.group && process(direct_child.pid)? == *direct_child,
+        "Git pager identity changed"
+    );
+    let mut wrapper = None;
+    let pager = if system_executable(direct_child.pid, "/usr/bin/less")?
+        || system_executable(direct_child.pid, "/usr/bin/more")?
+    {
+        direct_child
+    } else if system_executable(direct_child.pid, "/bin/sh")? {
+        let pager_children: Vec<_> = table
+            .values()
+            .filter(|child| child.parent == direct_child.pid)
+            .collect();
+        ensure!(pager_children.len() == 1, "Git pager wrapper is ambiguous");
+        wrapper = Some(direct_child);
+        pager_children[0]
+    } else {
+        anyhow::bail!("Git pager is not system less or more");
+    };
     ensure!(
         pager.group == git.group && process(pager.pid)? == *pager,
         "Git pager identity changed"
@@ -605,6 +625,18 @@ pub fn git_pager_stdio(table: &HashMap<u32, Process>, git: &Process, shell: u32)
             || system_executable(pager.pid, "/usr/bin/more")?,
         "Git pager is not system less or more"
     );
+    if let Some(wrapper) = wrapper {
+        let (argv, _) = argv_and_cwd(wrapper)?;
+        let (pager_argv, _) = argv_and_cwd(pager)?;
+        let script = argv.get(2).context("Git pager wrapper has no command")?;
+        ensure!(
+            argv.first()
+                .is_some_and(|arg| Path::new(arg).file_name().is_some_and(|name| name == "sh"))
+                && argv.get(1).is_some_and(|arg| arg == "-c")
+                && super::plain_shell_command_matches(script, &pager_argv),
+            "Git pager wrapper is not a system shell command"
+        );
+    }
     let input = pipe(pager.pid, 0)?;
     ensure!(
         terminal.rdev == controlling_terminal(pager.pid)?
@@ -644,7 +676,14 @@ pub fn git_pager_stdio(table: &HashMap<u32, Process>, git: &Process, shell: u32)
         ensure!(copies >= 2, "Git original terminal outputs are unavailable");
     }
     ensure!(
-        process(git.pid)? == *git && process(pager.pid)? == *pager,
+        process(git.pid)? == *git,
+        "Git process changed during capture"
+    );
+    ensure!(
+        process(pager.pid)? == *pager
+            && wrapper.is_none_or(|wrapper| {
+                process(wrapper.pid).is_ok_and(|current| current == *wrapper)
+            }),
         "Git pager process changed during capture"
     );
     Ok(())
