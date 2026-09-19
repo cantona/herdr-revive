@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.2 — 2026-09-19 (prerelease)
+
+- Preserve exact bare-agent sessions when an agent internally redirects
+  stdout or stderr to `/dev/null`, including Codex on macOS.
+- Accept Git's single plain system-shell wrapper around system `less` or
+  `more`, so an active pager in another pane cannot block atomic autosave.
+  Shell expansions, operators, pipelines, queued commands, and redirected
+  pager output remain refused.
+- Add Linux and macOS live-session, restart, security, regression, and
+  before/after performance validation for the affected paths.
+
 ## 0.1.1 — 2026-09-19 (prerelease)
 
 - Native macOS process/argv/cwd and launcher-environment capture, terminal and

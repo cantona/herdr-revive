@@ -106,7 +106,7 @@ On macOS, install Xcode Command Line Tools (`xcode-select --install`) for the li
 Install the tagged source release; Herdr previews the manifest and builds it:
 
 ```sh
-herdr plugin install cantona/herdr-revive --ref v0.1.1
+herdr plugin install cantona/herdr-revive --ref v0.1.2
 herdr plugin config-dir cantona.herdr-revive
 ```
 
@@ -328,7 +328,7 @@ REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/integration.py
 python3 tests/real_host.py
 REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/openssh.py
 python3 scripts/verify_install.py
-python3 scripts/verify_install.py --github-ref v0.1.1
+python3 scripts/verify_install.py --github-ref v0.1.2
 python3 scripts/benchmark.py --include-cli
 python3 tests/benchmark_contracts.py
 python3 scripts/benchmark_matched.py --baseline ../herdr-resurrect

@@ -1,9 +1,9 @@
 # Release, migration and rollback
 
-Version 0.1.1 is a Linux and macOS prerelease of `cantona/herdr-revive`, licensed
+Version 0.1.2 is a Linux and macOS prerelease of `cantona/herdr-revive`, licensed
 under MIT. It is built from source during installation. The manifest advertises
-both platforms; the original 0.1.0 release remains Linux-only. See
-[macOS and Linux regression validation](MACOS.md). Windows remains planned.
+both platforms. See [macOS and Linux regression validation](MACOS.md). Windows
+remains planned.
 
 ## Build and installation
 
@@ -11,7 +11,7 @@ Requires Rust/Cargo 1.97.1+, a C linker, Git, and Herdr 0.9.1 / protocol 22.
 The runtime currently refuses other host version/protocol pairs.
 
 ```sh
-herdr plugin install cantona/herdr-revive --ref v0.1.1
+herdr plugin install cantona/herdr-revive --ref v0.1.2
 herdr plugin config-dir cantona.herdr-revive
 ```
 
