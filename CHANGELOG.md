@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-09-19 (prerelease)
 
 - Native macOS process/argv/cwd and launcher-environment capture, terminal and
   null-stream validation, OpenSSH output recovery, and Apple Git pager support.

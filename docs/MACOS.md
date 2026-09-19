@@ -1,9 +1,9 @@
 # macOS support and validation
 
-The current checkout adds native macOS support; the original `v0.1.0` tag remains
-Linux-only. Build with `cargo build --release --locked`, then link this checkout
-using the README's local installation instructions. Xcode Command Line Tools,
-Rust 1.97.1+, and Herdr 0.9.1 / protocol 22 are required.
+Version `v0.1.1` adds native macOS support; the original `v0.1.0` tag remains
+Linux-only. Install with `herdr plugin install cantona/herdr-revive --ref v0.1.1`,
+or build and link a local checkout using the README's development instructions.
+Xcode Command Line Tools, Rust 1.97.1+, and Herdr 0.9.1 / protocol 22 are required.
 
 ## Implementation and limits
 

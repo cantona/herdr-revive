@@ -17,7 +17,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--github-ref", help="also test GitHub build failures and managed reinstall")
 args = parser.parse_args()
 with tempfile.TemporaryDirectory(prefix="herdr-revive-install-", dir="/tmp") as tmp:
-    root = Path(tmp)
+    root = Path(tmp).resolve()
     env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
     env.update(XDG_CONFIG_HOME=str(root / "config"), XDG_STATE_HOME=str(root / "state"),
                XDG_DATA_HOME=str(root / "data"), XDG_CACHE_HOME=str(root / "cache"),
