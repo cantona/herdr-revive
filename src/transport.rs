@@ -201,17 +201,10 @@ pub fn direct_request(
     bytes: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    use nix::sys::socket::{
-        AddressFamily, SockFlag, SockType, UnixAddr, connect, socket as new_socket,
-    };
+    use nix::sys::socket::{UnixAddr, connect};
     use std::os::fd::AsRawFd;
     let deadline = Instant::now() + timeout;
-    let fd = new_socket(
-        AddressFamily::Unix,
-        SockType::Stream,
-        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
-        None,
-    )?;
+    let fd = nonblocking_socket()?;
     match connect(fd.as_raw_fd(), &UnixAddr::new(socket)?) {
         Ok(()) => {}
         Err(nix::errno::Errno::EINPROGRESS) => {}
@@ -262,6 +255,25 @@ pub fn direct_request(
             Err(_) => bail!("Herdr socket read failed"),
         }
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn nonblocking_socket() -> Result<std::os::fd::OwnedFd> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+    #[cfg(target_os = "linux")]
+    let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = SockFlag::empty();
+    // Darwin does not support SOCK_NONBLOCK/SOCK_CLOEXEC at socket creation.
+    let fd = socket(AddressFamily::Unix, SockType::Stream, flags, None)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+        use std::os::fd::AsRawFd;
+        fcntl(fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+    }
+    Ok(fd)
 }
 
 #[cfg(unix)]

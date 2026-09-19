@@ -7,32 +7,36 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 
+from process_inspect import argv as process_argv, environment, executable_name, fd_target
+
 ROOT = Path(__file__).resolve().parents[1]
-BIN = ROOT / "target/release/herdr-revive"
+BIN = Path(os.environ.get("REVIVE_BINARY", ROOT / "target/release/herdr-revive"))
 HERDR = shutil.which("herdr")
 
 
 class RealHost(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="herdr-revive-host-")
-        self.root = Path(self.temp.name)
+        self.temp = tempfile.TemporaryDirectory(prefix="herdr-revive-host-", dir="/tmp")
+        self.root = Path(self.temp.name).resolve()
         self.env = {k:v for k,v in os.environ.items() if not k.startswith("HERDR_")}
         self.env.update(XDG_CONFIG_HOME=str(self.root/"config"), XDG_STATE_HOME=str(self.root/"state"),
             HERDR_CONFIG_PATH=str(self.root/"config/herdr/config.toml"),
             HERDR_SOCKET_PATH=str(self.root/"host.sock"), HERDR_BIN_PATH=HERDR,
             HERDR_PLUGIN_CONFIG_DIR=str(self.root/"plugin-config"),
-            HERDR_PLUGIN_STATE_DIR=str(self.root/"plugin-state"), HERDR_PLUGIN_ID="cantona.herdr-revive")
+            HERDR_PLUGIN_STATE_DIR=str(self.root/"plugin-state"), HERDR_PLUGIN_ID="cantona.herdr-revive",
+            TERM="xterm-256color")
         shell = self.root/"fixture-shell"
         shell.write_text('#!/bin/sh\nexec /bin/bash --noprofile --norc "$@"\n')
         shell.chmod(0o700)
         self.env["SHELL"] = str(shell)
         self.config = self.root/"plugin-config/config.toml"
         self.config.parent.mkdir()
-        self.config.write_text('settle_ms = 0\nallowed_programs = ["sleep", "/usr/bin/sleep", "/bin/sleep"]\n')
+        self.config.write_text('settle_ms = 0\nallowed_programs = ["sleep", "/bin/sleep"]\n')
         self.log = open(self.root/"server.log", "w")
         self.server = subprocess.Popen([HERDR,"server"],env=self.env,cwd=self.root,stdout=self.log,stderr=self.log)
         deadline = time.monotonic()+10
@@ -70,7 +74,7 @@ class RealHost(unittest.TestCase):
         created = self.api("workspace.create",dict(label="Saved workspace",cwd=str(self.root),focus=False))
         workspace = created["workspace"]["workspace_id"]
         def leaf(label):
-            return dict(type="pane",label=label,cwd=str(self.root),command=["/usr/bin/sleep","60"])
+            return dict(type="pane",label=label,cwd=str(self.root),command=["/bin/sleep","60"])
         root = dict(type="split",direction="right",ratio=0.65,first=leaf("left"),second=dict(
             type="split",direction="down",ratio=0.3,first=leaf("top"),second=leaf("bottom")))
         self.api("layout.apply",dict(tab_id=created["tab"]["tab_id"],tab_label="Nested",focus=False,root=root))
@@ -82,7 +86,10 @@ class RealHost(unittest.TestCase):
         self.config.write_text('settle_ms = 100\nmatch_program_basename = true\nallowed_programs = ["top", "htop", "journalctl", "tail"]\n')
         logfile = self.root / "fixture.log"
         logfile.write_text("revive monitor fixture\n")
-        for argv in [["top"], ["htop"], ["journalctl", "-f", "-n", "0"], ["tail", "-f", str(logfile)]]:
+        commands = [["tail", "-f", str(logfile)]]
+        if sys.platform != "darwin":
+            commands += [["top"], ["htop"], ["journalctl", "-f", "-n", "0"]]
+        for argv in commands:
             with self.subTest(program=argv[0]):
                 created = self.api("workspace.create", dict(label=argv[0], cwd=str(self.root), focus=False))
                 pane = created["root_pane"]["pane_id"]
@@ -93,10 +100,10 @@ class RealHost(unittest.TestCase):
                         info = self.api("pane.process_info", dict(pane_id=pane))["process_info"]
                         pid = info.get("foreground_process_group_id")
                         try:
-                            executable = Path(os.readlink(f"/proc/{pid}/exe")).name
+                            executable = executable_name(pid)
                             if executable == program:
                                 return pid
-                        except FileNotFoundError:
+                        except (FileNotFoundError, subprocess.CalledProcessError):
                             pass
                         time.sleep(0.05)
                     self.fail(f"{program} did not become foreground: {info}")
@@ -122,8 +129,21 @@ class RealHost(unittest.TestCase):
                 self.assertEqual(next(p["command"] for p in recaptured["panes"] if p["pane_id"] == pane), command)
                 self.api("workspace.close", dict(workspace_id=created["workspace"]["workspace_id"]))
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS protected-process restriction")
+    def test_protected_process_capture_preserves_previous_snapshot(self):
+        created = self.api("workspace.create", dict(label="Protected", cwd=str(self.root), focus=False))
+        pane = created["root_pane"]["pane_id"]
+        time.sleep(0.1)
+        path = Path(self.run_cli("save")["result"]["path"])
+        before = path.read_bytes()
+        # macOS top is setuid root; Herdr cannot report its foreground group.
+        self.api("pane.send_input", dict(pane_id=pane, text="/usr/bin/top", keys=["Enter"]))
+        time.sleep(0.2)
+        self.run_cli("save", ok=False)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_git_internal_pager_restores_but_external_pipe_is_refused(self):
-        self.config.write_text('settle_ms = 100\nallowed_programs = ["git"]\n')
+        self.config.write_text('settle_ms = 100\nmatch_program_basename = true\nallowed_programs = ["git"]\n')
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         subprocess.run(["git", "-C", str(self.root), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                         "commit", "-q", "--allow-empty", "-m", "revive pager fixture"], check=True)
@@ -131,6 +151,8 @@ class RealHost(unittest.TestCase):
         pane = created["root_pane"]["pane_id"]
         # Plain less stays open even with one line; no shell wrapper in core.pager.
         argv = ["git", "-c", "core.pager=less", "log", "--oneline"]
+        if sys.platform == "darwin":
+            argv[0] = subprocess.check_output(["/usr/bin/xcrun", "--find", "git"], text=True).strip()
         import shlex
         self.api("pane.send_input", dict(pane_id=pane, text="GIT_PAGER=less LESS= "+shlex.join(argv), keys=["Enter"]))
 
@@ -160,11 +182,11 @@ class RealHost(unittest.TestCase):
         large = self.root / "large.txt"
         large.write_text("pager output " * 10 + "\n")
         large.write_text(large.read_text() * 20000)
-        active = ["git", "diff", "--no-index", "/dev/null", str(large)]
+        active = [argv[0], "diff", "--no-index", "/dev/null", str(large)]
         self.api("pane.send_input", dict(pane_id=pane, text=shlex.join(active), keys=["Enter"]))
         info = wait_process("less")
         git_pid = next(p["pid"] for p in info["foreground_processes"] if p["name"] == "git")
-        self.assertTrue(os.readlink(f"/proc/{git_pid}/fd/1").startswith("pipe:"))
+        self.assertTrue(fd_target(git_pid, 1).startswith("pipe:"))
         active_path = Path(self.run_cli("save")["result"]["path"])
         self.assertEqual(json.loads(active_path.read_text())["panes"][0]["command"], dict(kind="program", argv=active))
         self.api("pane.send_input", dict(pane_id=pane, text="q"))
@@ -212,14 +234,14 @@ class RealHost(unittest.TestCase):
             for pane in panes:
                 process=self.api("pane.process_info",dict(pane_id=pane["pane_id"]))["process_info"]
                 argv=process["foreground_processes"][0]["argv"]
-                self.assertEqual(argv,["/usr/bin/sleep","60"])
+                self.assertEqual(argv,["/bin/sleep","60"])
         self.assertNotEqual(copies[0],copies[1])
         self.assertNotIn(source,copies)
 
     def test_null_streams_survive_native_layout_reconstruction_and_recapture(self):
         created = self.api("workspace.create", dict(label="Null stdout", cwd=str(self.root), focus=False))
         pane = created["root_pane"]["pane_id"]
-        self.api("pane.send_input", dict(pane_id=pane, text="/usr/bin/sleep 60 >/dev/null 2>/dev/null", keys=["Enter"]))
+        self.api("pane.send_input", dict(pane_id=pane, text="/bin/sleep 60 >/dev/null 2>/dev/null", keys=["Enter"]))
         time.sleep(0.2)
         self.run_cli("space", "save", "null-output", "--workspace", created["workspace"]["workspace_id"])
         result = self.run_cli("space", "open", "null-output", "--no-focus")
@@ -227,11 +249,11 @@ class RealHost(unittest.TestCase):
         restored = next(p for p in self.api("session.snapshot")["snapshot"]["panes"] if p["workspace_id"] == workspace)
         info = self.api("pane.process_info", dict(pane_id=restored["pane_id"]))["process_info"]
         pid = info["foreground_process_group_id"]
-        self.assertEqual(Path(f"/proc/{pid}/cmdline").read_bytes(), b"/usr/bin/sleep\x0060\x00")
-        self.assertEqual([os.readlink(f"/proc/{pid}/fd/{fd}") for fd in (1, 2)], ["/dev/null"] * 2)
+        self.assertEqual(process_argv(pid), [b"/bin/sleep", b"60"])
+        self.assertEqual([fd_target(pid, fd) for fd in (1, 2)], ["/dev/null"] * 2)
         path = self.run_cli("space", "save", "recaptured", "--workspace", workspace)["result"]["path"]
         command = json.loads(Path(path).read_text())["panes"][0]["command"]
-        self.assertEqual(command, dict(kind="program_null_stdio", argv=["/usr/bin/sleep", "60"], null_stdio=[False, True, True]))
+        self.assertEqual(command, dict(kind="program_null_stdio", argv=["/bin/sleep", "60"], null_stdio=[False, True, True]))
 
     def test_explicit_recreate_uses_new_workspace_and_preserves_source(self):
         source=self.source()
@@ -267,7 +289,7 @@ class RealHost(unittest.TestCase):
         saved = self.run_cli("space","save","large","--workspace",workspace)
         path = Path(saved["result"]["path"])
         data = json.loads(path.read_text())
-        data["panes"][-1]["command"] = dict(kind="program",argv=["/usr/bin/sleep","60"])
+        data["panes"][-1]["command"] = dict(kind="program",argv=["/bin/sleep","60"])
         path.write_text(json.dumps(data))
         focus = self.api("session.snapshot")["snapshot"]["focused_pane_id"]
         result = self.run_cli("space","open","large","--no-focus")
@@ -279,9 +301,12 @@ class RealHost(unittest.TestCase):
         for pane in [p for p in live["panes"] if p["workspace_id"] == target]:
             info = self.api("pane.process_info",dict(pane_id=pane["pane_id"]))["process_info"]
             for process in info["foreground_processes"]:
-                if process.get("argv") == ["/usr/bin/sleep","60"]:
-                    env = Path(f"/proc/{process['pid']}/environ").read_bytes().split(b"\0")
-                    self.assertIn(f"HERDR_TAB_ID={pane['tab_id']}".encode(),env)
+                if process.get("argv") == ["/bin/sleep","60"]:
+                    # SIP hides system sleep's environment on macOS. The
+                    # custom-agent test below checks readable native env there.
+                    if sys.platform != "darwin":
+                        env = environment(process['pid'])
+                        self.assertIn(f"HERDR_TAB_ID={pane['tab_id']}".encode(),env)
                     found = True
         self.assertTrue(found)
         journal_path = next((self.root/"plugin-state").glob(f"*/operations/{result['result']['operation']}.json"))
@@ -324,10 +349,10 @@ class RealHost(unittest.TestCase):
         created = self.api("workspace.create",dict(label="Restart",cwd=str(self.root),focus=False))
         pane = created["root_pane"]["pane_id"]
         time.sleep(0.1)
-        self.api("pane.send_input",dict(pane_id=pane,text="/usr/bin/sleep 60",keys=["Enter"]))
+        self.api("pane.send_input",dict(pane_id=pane,text="/bin/sleep 60",keys=["Enter"]))
         time.sleep(0.1)
         self.run_cli("save")
-        self.config.write_text('auto_restore = true\nsettle_ms = 100\nallowed_programs = ["/usr/bin/sleep"]\n')
+        self.config.write_text('auto_restore = true\nsettle_ms = 100\nallowed_programs = ["/bin/sleep"]\n')
         time.sleep(0.3)
         self.server.terminate()
         self.server.wait(timeout=5)
@@ -345,7 +370,7 @@ class RealHost(unittest.TestCase):
         self.assertEqual(result["result"]["journal"]["entries"][0]["outcome"],"applied")
         time.sleep(0.1)
         info = self.api("pane.process_info",dict(pane_id=pane))["process_info"]
-        self.assertIn(["/usr/bin/sleep","60"],[p["argv"] for p in info["foreground_processes"]])
+        self.assertIn(["/bin/sleep","60"],[p["argv"] for p in info["foreground_processes"]])
         self.assertEqual(self.run_cli("event")["result"]["status"],"boot_done")
 
     def test_restart_preserves_custom_agent_launcher_without_native_resume(self):
@@ -389,8 +414,8 @@ class RealHost(unittest.TestCase):
                 info = self.api("pane.process_info", dict(pane_id=pane))["process_info"]
                 canonical = [p for p in info["foreground_processes"] if p.get("argv") == ["claude", "--resume", session]]
                 if canonical:
-                    environment = Path(f"/proc/{canonical[0]['pid']}/environ").read_bytes().split(b"\0")
-                    self.assertFalse(any(value.startswith(b"CLAUDE_CONFIG_DIR=") for value in environment))
+                    env = environment(canonical[0]['pid'])
+                    self.assertFalse(any(value.startswith(b"CLAUDE_CONFIG_DIR=") for value in env))
                     break
             except (OSError, KeyError):
                 pass
@@ -421,7 +446,7 @@ class RealHost(unittest.TestCase):
             matches = [p for p in info["foreground_processes"] if p.get("argv") == [str(bindir / "claude"), "--resume", session]]
             if matches:
                 pid = matches[0]["pid"]
-                self.assertIn(f"CLAUDE_CONFIG_DIR={profile}".encode(), Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"))
+                self.assertIn(f"CLAUDE_CONFIG_DIR={profile}".encode(), environment(pid))
                 break
             self.assertLess(time.monotonic(), deadline, info)
             time.sleep(0.05)

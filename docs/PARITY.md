@@ -24,7 +24,7 @@ modified or imported into this repository.
 | Lifecycle autosave | All baseline events plus tab creation/closure/rename, workspace rename and agent status |
 | Startup restore without agent event | Startup hook shares the same persistent automatic boot claim |
 | Concurrent hooks and restart safety | Session file lock; peer PID/start-time boot identity; durable no-retry evidence |
-| Platform targets | Linux now; macOS and Windows remain planned |
+| Platform targets | Linux and macOS; Windows remains planned |
 
 Additional capabilities include native argv launch during reconstruction, bounded
 version-checked direct IPC, strict snapshot/config schemas, redacted previews,

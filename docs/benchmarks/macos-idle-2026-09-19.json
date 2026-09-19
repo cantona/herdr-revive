@@ -1,0 +1,68 @@
+{
+  "machine": {
+    "system": "Darwin",
+    "release": "25.6.0",
+    "version": "Darwin Kernel Version 25.6.0: Fri Jul 31 19:17:12 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T8103",
+    "machine": "arm64"
+  },
+  "checks_per_sample": 100,
+  "binary_sha256": {
+    "candidate": "53b3d9482b3cffe4f28c883ac5a0343057c3fdbd8b2de8facf5829325b8bbb21"
+  },
+  "load_start": [
+    3.40087890625,
+    2.5810546875,
+    2.3203125
+  ],
+  "load_end": [
+    3.40087890625,
+    2.5810546875,
+    2.3203125
+  ],
+  "samples_ms": {
+    "candidate": [
+      2.082875,
+      1.889167,
+      1.846042,
+      1.842667,
+      2.031208,
+      2.562958,
+      2.464709,
+      2.278666,
+      2.201375,
+      2.140792,
+      2.064083,
+      2.0529580000000003,
+      1.837209,
+      1.7634580000000002,
+      1.836875,
+      1.803208,
+      1.782375,
+      1.865625,
+      1.7398330000000002,
+      1.813958,
+      1.724708,
+      1.998584,
+      1.706291,
+      1.8454579999999998,
+      1.7967499999999998,
+      1.815875,
+      1.92475,
+      1.726875,
+      2.004,
+      1.824584
+    ]
+  },
+  "summary": {
+    "candidate": {
+      "median_ms": 1.8457499999999998,
+      "min_ms": 1.706291,
+      "max_ms": 2.562958
+    }
+  },
+  "method": "randomized fresh helper launches; elapsed time inside the idle-shell API loop",
+  "limitations": [
+    "Repeated checks of one real idle shell; no host API or command startup",
+    "Not end-to-end restore latency; host process count/load uncontrolled"
+  ]
+}

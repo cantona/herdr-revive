@@ -42,8 +42,53 @@ pub fn run(mut cli: Cli) -> Result<Value> {
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        anyhow::bail!("timer signal handling is only validated on Linux")
+        use nix::sys::{
+            event::{EventFilter, EventFlag, FilterFlag, KEvent, Kqueue},
+            signal::{SigSet, Signal},
+        };
+        let signals = [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP];
+        let mut mask = SigSet::empty();
+        for signal in signals {
+            mask.add(signal);
+        }
+        mask.thread_block()?;
+        let queue = Kqueue::new()?;
+        let changes: Vec<_> = signals
+            .iter()
+            .map(|signal| {
+                KEvent::new(
+                    *signal as usize,
+                    EventFilter::EVFILT_SIGNAL,
+                    EventFlag::EV_ADD | EventFlag::EV_CLEAR,
+                    FilterFlag::empty(),
+                    0,
+                    0,
+                )
+            })
+            .collect();
+        queue.kevent(&changes, &mut [], None)?;
+        cli.command = Action::Autosave { force: true };
+        let mut events = [changes[0]];
+        loop {
+            println!("{}", crate::app::run(cli.clone())?);
+            let count = queue.kevent(
+                &[],
+                &mut events,
+                Some(nix::libc::timespec {
+                    tv_sec: interval as i64,
+                    tv_nsec: 0,
+                }),
+            )?;
+            if count > 0 {
+                let result = crate::app::run(cli)?;
+                return Ok(json!({"status":"timer_stopped","final_save":result}));
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        anyhow::bail!("timer signal handling is unsupported on this platform")
     }
 }

@@ -725,8 +725,17 @@ fn launch_splits(
             std::time::Instant::now() + std::time::Duration::from_millis(config.timeout_ms);
         let shell = loop {
             let info = host.process_info(target)?;
-            if let Some(shell) = platform::idle_shell(&info)? {
-                break shell;
+            match platform::idle_shell(&info) {
+                Ok(Some(shell)) => break shell,
+                Ok(None) => {}
+                // A newly spawned shell can be between exec and readable argv.
+                // Retry observation only; never send until validation succeeds.
+                Err(error) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error)
+                            .context("new pane metadata did not become available before deadline");
+                    }
+                }
             }
             ensure!(
                 std::time::Instant::now() < deadline,

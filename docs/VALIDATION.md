@@ -1,5 +1,8 @@
 # Validation and remaining gates
 
+Current macOS coverage and native performance measurements are recorded in
+[MACOS.md](MACOS.md). The results below describe the original Linux prerelease.
+
 Measured and tested on 2026-09-18 HKT (2026-09-17/18 UTC), Linux x86_64,
 Rust 1.97.1, Herdr 0.9.1/protocol 22. These are local test results for the
 initial Linux prerelease, not certification of every host, filesystem or interactive program.
@@ -110,8 +113,9 @@ in the raw measurements.
   tested; running an older Herdr binary is not.
 - Public marketplace indexing is external to this repository and does not imply
   a host review or endorsement.
-- macOS and Windows native implementations and runtime matrices remain planned.
-  The manifest advertises Linux only.
+- Windows implementation and Intel macOS runtime qualification remain planned.
+  The current manifest advertises Linux and macOS; Apple Silicon results are
+  recorded separately above.
 
 There is no legacy importer or automatic migration. Native formats and explicit
 migration instructions are described in the README.

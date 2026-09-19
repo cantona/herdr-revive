@@ -24,6 +24,10 @@ UID as the plugin. Socket chmod/chown timestamps cannot create a new claim.
 PID reuse across either a process restart or OS reboot changes identity.
 Peer-identity connections send no API request; metrics count them separately.
 
+macOS generation uses SHA-256 over
+`macos-server-v1:<kern.bootsessionuuid>:<LOCAL_PEERPID>:<process start microseconds>`.
+`LOCAL_PEERCRED` verifies the same-user peer. The Linux generation format is unchanged.
+
 ```
 HERDR_PLUGIN_STATE_DIR/<session hash>/
   operation.lock
@@ -76,7 +80,8 @@ be null for an idle shell. Agent commands instead use
 Program stdout/stderr may target `/dev/null` using
 `{"kind":"program_null_stdio","argv":["sleep","60"],"null_stdio":[false,true,false]}`.
 The mask is stdin/stdout/stderr; stdin must remain false and at least one output
-must be true. Capture checks the null character-device identity (Linux 1:3).
+must be true. Capture checks the null character-device identity (Linux 1:3;
+macOS vnode device/inode/rdev matched against the native `/dev/null`).
 Restoration checks the original executable's allowlist entry, then passes its
 argv as positional arguments to a fixed `/bin/sh` exec/redirection wrapper.
 No saved argument is interpolated into that wrapper's shell source.
@@ -152,10 +157,17 @@ operations without CLI equivalents use direct API even in CLI mode.
 
 Direct save uses ping + one snapshot + one process-info request per pane +
 one layout export per tab,
-and one `/proc` table scan, with no Herdr or process-enumeration subprocesses.
+and one native process-table scan, with no Herdr or process-enumeration subprocesses.
 Preview uses ping + one snapshot and no process queries. Execution deliberately
 adds fresh identity and busy checks. There is no persistent connection,
-unsupported batching, host library dependency, FFI or application `unsafe` code.
+unsupported batching or host library dependency. macOS uses bounded native FFI
+calls with per-statement `unsafe` allowances and ABI size checks; other code
+denies `unsafe`. Idle-shell checks on macOS query direct children and recheck
+process identity rather than repeating the whole process-table scan. Linux checks
+each shell thread's child list and falls back to the original process-table scan
+if those lists are unavailable. Newly created split panes retry unavailable shell
+metadata within the readiness deadline; no command is sent on an invalid read. The timer
+waits on kqueue signals without polling during its interval.
 
 ## Intentional restrictions
 

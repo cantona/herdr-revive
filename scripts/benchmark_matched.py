@@ -58,7 +58,7 @@ def build_programs(root):
 
 
 class Fixture:
-    def __init__(self, stack, root, count, baseline, programs, shell, herdr, empty_arg_probe=False):
+    def __init__(self, stack, root, count, baseline, programs, shell, herdr, empty_arg_probe=False, variants=VARIANTS):
         self.root, self.count, self.baseline = root, count, baseline
         self.empty_arg_probe = empty_arg_probe
         self.probe_results = {}
@@ -84,7 +84,7 @@ class Fixture:
                 time.sleep(0.05)
         self.expected = {}
         self.populate(programs)
-        for variant in VARIANTS:
+        for variant in variants:
             directory = root / variant
             (directory / "config").mkdir(parents=True)
             (directory / "state").mkdir()
@@ -101,7 +101,7 @@ class Fixture:
                 if json.loads(result.stdout)["result"]["status"] != "no_snapshot":
                     raise AssertionError("Rust boot setup must not restore anything")
         self.latest = {}
-        for variant in VARIANTS:
+        for variant in variants:
             self.invoke(variant, "save")
             pattern = "sessions/*/last.json" if variant == "javascript_cli" else "*/latest.json"
             paths = list((root / variant / "state").glob(pattern))
@@ -170,6 +170,19 @@ class Fixture:
                 value = (cwd, "agent", [agent, session])
             self.expected[pane["pane_id"]] = value
             if slot != 1:
+                # Fixture setup is untimed. Wait for the shell, rather than
+                # sending input while a freshly created PTY is still starting.
+                ready_deadline = time.monotonic() + 10
+                while True:
+                    info = self.api("pane.process_info", dict(pane_id=pane["pane_id"]))["process_info"]
+                    foreground = info.get("foreground_processes", [])
+                    if (info.get("foreground_process_group_id") == info.get("shell_pid")
+                            and len(foreground) == 1 and foreground[0].get("name") == "bash"
+                            and foreground[0].get("argv")):
+                        break
+                    if time.monotonic() >= ready_deadline:
+                        raise AssertionError("fixture shell did not become ready")
+                    time.sleep(0.02)
                 self.api("pane.send_input", dict(pane_id=pane["pane_id"], text=shlex.join(argv), keys=["Enter"]))
         deadline = time.monotonic() + 10
         expected_agents = sum(v[1] == "agent" for v in self.expected.values())

@@ -13,6 +13,7 @@ import time
 import unittest
 
 from integration import Fixture
+from process_inspect import fd_target
 
 
 @unittest.skipUnless(Path("/usr/bin/ssh").exists() and shutil.which("sshd"), "OpenSSH client/server required")
@@ -58,7 +59,7 @@ class OpenSsh(unittest.TestCase):
         os.write(f.master, (shlex.join(self.argv) + suffix + "\n").encode())
         f.wait_output(b"SSH_ERROR_READY\r\n")
         pid = os.tcgetpgrp(f.master)
-        self.assertEqual(os.readlink(f"/proc/{pid}/fd/1"), "/dev/null")
+        self.assertEqual(fd_target(pid, 1), "/dev/null")
         return pid
 
     def test_session_stdout_is_recaptured_and_restored_to_terminal(self):

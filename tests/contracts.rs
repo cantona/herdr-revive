@@ -684,6 +684,7 @@ fn process_identity_detects_pid_reuse() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn stat_parser_handles_spaces_and_parentheses_in_process_names() {
     let stat = format!(
         "42 (name ) ( with spaces) S 12 42 {} 9876 0",
@@ -773,7 +774,7 @@ fn configurable_program_matching_and_safe_agent_options() {
 #[test]
 fn rename_preserves_snapshot_and_boot_identity() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("host.sock");
+    let socket = dir.path().canonicalize().unwrap().join("host.sock");
     let (_, session) = store::session_identity(&socket).unwrap();
     assert_eq!(
         session,

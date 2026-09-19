@@ -2,8 +2,8 @@
 
 Version 0.1.0 is an initial Linux prerelease of `cantona/herdr-revive`, licensed
 under MIT. It is built from source during installation. The manifest advertises
-Linux; macOS and Windows remain planned targets requiring their own adapters
-and runtime qualification.
+Linux. Current unreleased source also supports macOS; build and link the checkout
+to use it. See [macOS validation](MACOS.md). Windows remains planned.
 
 ## Build and installation
 

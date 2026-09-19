@@ -6,7 +6,8 @@ them from retained snapshots or reusable named workspaces.
 
 An independent MIT-licensed Rust plugin by Su Kang Yin.
 Package/executable: `herdr-revive`; plugin: `cantona.herdr-revive`.
-**0.1.0 is a Linux prerelease.** macOS and Windows remain planned.
+**Current source supports Linux and macOS.** The original `v0.1.0` tag is a
+Linux prerelease; build and link this checkout for macOS support. Windows remains planned.
 
 ## Why this plugin exists
 
@@ -45,7 +46,7 @@ inside tmux, so they are alternatives at the terminal-multiplexer level.
 | Terminal contents | Optional native pane history | Uses host capability | Uses host capability | Optional pane contents |
 | Vim/Neovim session integration | No editor-session strategy | Relaunch command | Relaunch command | Optional session-file strategy |
 | Plugin runtime | Included in Herdr | Node.js | Native binary; shell for popups | Bash and tmux |
-| Platform scope | Herdr's supported platforms | Manifest lists Linux/macOS/Windows | Linux validated | Upstream reports Linux/macOS/Cygwin |
+| Platform scope | Herdr's supported platforms | Manifest lists Linux/macOS/Windows | Linux and macOS | Upstream reports Linux/macOS/Cygwin |
 
 See the [detailed replacement matrix](docs/PARITY.md) for named spaces, actions,
 layout reconstruction and migration differences. Revive does not import the
@@ -97,10 +98,11 @@ and [validation](docs/VALIDATION.md) before enabling automatic restoration.
 
 ## Installation
 
-Requires Linux with readable `/proc`, Rust/Cargo **1.97.1+**, a C linker, and
+Requires Linux with readable `/proc` or macOS, Rust/Cargo **1.97.1+**, a C linker, and
 Herdr **0.9.1 / protocol 22**. The runtime currently accepts only that host pair.
 No Node or Python runtime is required. The popup uses POSIX `sh`, with optional
 `fzf` for saved-space selection. Python 3 is used only by development scripts.
+On macOS, install Xcode Command Line Tools (`xcode-select --install`) for the linker.
 
 Install the tagged source release; Herdr previews the manifest and builds it:
 
@@ -253,8 +255,9 @@ limit and preserving launch-time tab identity. These split-created panes and
 existing panes use tested Bash/dash/zsh shell encoding.
 No existing workspace is deleted by reconstruction.
 
-Linux capture reads `/proc` argv/cwd with PID/start-time checks. Display command
-lines are never parsed. Program stdout/stderr redirected to the Linux `/dev/null`
+Linux capture reads `/proc`; macOS uses native `libproc` and `sysctl` calls for
+argv/cwd with PID/start-time checks. Display command lines are never parsed,
+and neither adapter launches process-inspection utilities. Program stdout/stderr redirected to `/dev/null`
 device are preserved explicitly. Non-UTF-8 arguments, terminal controls, inaccessible
 processes, pipelines and other redirected standard streams fail capture and preserve
 the last good snapshot. Background jobs are not reconstructed.
@@ -264,6 +267,14 @@ SSH output redirections are refused.
 Git's internal system `less`/`more` pager is recognized by its child relationship
 and stream identities, and restores by rerunning Git. External shell pipelines
 and redirected pager output remain unsupported.
+
+macOS uses authenticated Unix-socket peer credentials and a boot UUID to identify
+server restarts, and `kqueue` for autosave shutdown signals. Restore checks shell
+children directly instead of scanning every process for each idle pane. The
+[macOS validation and performance results](docs/MACOS.md) cover Apple Silicon;
+Intel macOS is compile-checked. Protected/setuid processes (including Apple's
+`top`) may not expose the required metadata. Missing process or configured
+launcher-environment data causes capture to fail and preserves the previous snapshot.
 
 Claude, Codex, Gemini, Copilot and Cursor resume require an exact UUID from a
 matching native reference or explicit resume arguments. Recognized Node package

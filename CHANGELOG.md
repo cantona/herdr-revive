@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Native macOS process/argv/cwd and launcher-environment capture, terminal and
+  null-stream validation, OpenSSH output recovery, and Apple Git pager support.
+- Authenticated macOS server generation and kqueue autosave shutdown handling.
+- Split Linux and macOS adapters into `src/platform/linux.rs` and `macos.rs`.
+  Darwin FFI exceptions are limited to individual checked calls; other code
+  continues to deny unsafe code.
+- Preserve direct transport with no process-inspection subprocesses. Idle checks
+  use direct child enumeration on macOS and per-thread child lists on Linux,
+  with the original Linux scan retained as a fallback. Newly created panes
+  retry transient shell metadata reads within their existing readiness deadline.
+- Portable native runtime tests and real mixed-pane performance measurements.
+
 ## 0.1.0 — 2026-09-18 (prerelease)
 
 - Documented and tested the required handoff from Herdr's native agent restore

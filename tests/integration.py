@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Isolated Linux PTY/API tests. No real Herdr session is used."""
+"""Isolated Linux/macOS PTY/API tests. No real Herdr session is used."""
 import concurrent.futures
 import json
 import os
 from pathlib import Path
 import pty
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -21,8 +22,9 @@ BINARY = Path(os.environ.get("REVIVE_BINARY", ROOT / "target/debug/herdr-revive"
 
 
 class Fixture:
-    def __init__(self, transport="direct", panes=1):
-        self.temp = tempfile.TemporaryDirectory(prefix="herdr-revive-test-")
+    def __init__(self, transport="direct", panes=1, shell="bash"):
+        # Darwin's default TMPDIR can exceed the Unix socket path limit.
+        self.temp = tempfile.TemporaryDirectory(prefix="herdr-revive-test-", dir="/tmp")
         self.root = Path(self.temp.name)
         self.config = self.root / "config"
         self.config.mkdir()
@@ -38,17 +40,21 @@ class Fixture:
         self.bin_dir.mkdir()
         for program in ("ssh", "minicom", "claude", "codex", "gemini", "copilot", "cursor-agent"):
             path = self.bin_dir / program
-            path.write_text("#!/usr/bin/python3\nimport json, os, sys\n"
+            path.write_text(f"#!{sys.executable}\nimport json, os, sys\n"
                             "with open(os.environ['REVIVE_TEST_OUTPUT'], 'w') as f:\n"
                             " json.dump(sys.argv, f)\n")
             path.chmod(0o700)
         self.master, slave = pty.openpty()
         env = os.environ.copy()
         env.update(PATH=str(self.bin_dir) + ":/usr/bin:/bin",
-                   REVIVE_TEST_OUTPUT=str(self.root / "argv.json"), PS1="FIXTURE_READY> ")
+                   REVIVE_TEST_OUTPUT=str(self.root / "argv.json"), PS1="FIXTURE_READY> ",
+                   TERM="dumb")
+        shell_path = shutil.which(shell)
+        # This PTY fixture has no terminal emulator to answer ZLE queries.
+        shell_args = [shell, "--noprofile", "--norc", "-i"] if shell == "bash" else [shell, "-f", "-i", "+o", "zle"]
         self.shell = subprocess.Popen([sys.executable, "-c",
             "import fcntl, termios, os; fcntl.ioctl(0, termios.TIOCSCTTY, 0); "
-            "os.execv('/bin/bash', ['bash', '--noprofile', '--norc', '-i'])"],
+            f"os.execv({shell_path!r}, {shell_args!r})"],
             stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
             cwd=self.root, env=env)
         self.pid = self.shell.pid
@@ -205,6 +211,36 @@ class Integration(unittest.TestCase):
         fixture = Fixture(**kwargs)
         self.addCleanup(fixture.close)
         return fixture
+
+    @unittest.skipUnless(shutil.which("zsh"), "zsh required")
+    def test_zsh_restores_literal_arguments_and_skips_background_jobs(self):
+        f = self.fixture(shell="zsh")
+        args = ["minicom", "", "space here", "'\"$;|`", "中文"]
+        f.seed(args)
+        f.run("restore", "--rehydrate")
+        self.assertEqual(f.wait_argv()[1:], args[1:])
+        f.wait_output(b"FIXTURE_READY>")
+        os.write(f.master, b"sleep 30 &\n")
+        f.wait_output(b"FIXTURE_READY>")
+        result = f.run("restore", "--rehydrate")
+        self.assertEqual(result["result"]["journal"]["entries"][0]["outcome"], "skipped")
+
+    def test_native_capture_preserves_literal_argv_and_cwd(self):
+        f = self.fixture()
+        source = f.root / "wait.c"
+        source.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
+        program = f.bin_dir / "fixture-job"
+        subprocess.run(["cc", str(source), "-o", str(program)], check=True)
+        args = [str(program), "", "space here", "'\"$;|`", "中文", "$(touch WRONG)"]
+        os.write(f.master, (shlex.join(args) + "\n").encode())
+        deadline = time.monotonic() + 3
+        while os.tcgetpgrp(f.master) == f.pid and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        saved = json.loads(Path(f.run("save")["result"]["path"]).read_text())["panes"][0]
+        self.assertEqual(saved["command"], dict(kind="program", argv=args))
+        self.assertEqual(Path(saved["cwd"]), f.root.resolve())
+        self.assertFalse((f.root / "WRONG").exists())
 
     def test_literal_ssh_and_minicom_through_both_transports(self):
         for transport in ("direct", "cli"):
@@ -365,7 +401,12 @@ class Integration(unittest.TestCase):
         f.write_config(allowed_programs=["claude", "claude-local"])
         with (f.config / "config.toml").open("a") as config:
             config.write('\n[[agent_launchers]]\nagent = "claude"\nexecutable = "claude-local"\nmatch_env = { CLAUDE_CONFIG_DIR = "/fixture/local" }\n')
-        os.write(f.master, b"CLAUDE_CONFIG_DIR=/fixture/local SECRET=never-save bash -c 'exec -a claude /usr/bin/sleep 60'\n")
+        # A native fixture exposes its environment on macOS; SIP may hide it
+        # for system binaries such as /bin/sleep.
+        source = f.root / "agent.c"
+        source.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
+        subprocess.run(["cc", str(source), "-o", str(f.bin_dir / "claude")], check=True)
+        os.write(f.master, b"CLAUDE_CONFIG_DIR=/fixture/local SECRET=never-save claude --resume 01234567-89ab-cdef-0123-456789abcdef\n")
         deadline = time.monotonic() + 3
         while os.tcgetpgrp(f.master) == f.pid and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -467,12 +508,16 @@ class Integration(unittest.TestCase):
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             pid = os.tcgetpgrp(f.master)
-            if pid != f.pid and Path(f"/proc/{pid}/comm").read_text().strip() == "sleep":
+            if pid != f.pid and (sys.platform == "darwin" or Path(f"/proc/{pid}/comm").read_text().strip() == "sleep"):
                 break
             time.sleep(0.02)
         self.assertNotEqual(pid, f.pid)
-        self.assertEqual([os.readlink(f"/proc/{pid}/fd/{fd}") for fd in (1, 2)], ["/dev/null"] * 2)
-        self.assertEqual(os.readlink(f"/proc/{pid}/fd/0"), os.readlink(f"/proc/{f.pid}/fd/0"))
+        if sys.platform == "darwin":
+            recaptured = json.loads(Path(f.run("save")["result"]["path"]).read_text())
+            self.assertEqual(recaptured["panes"][0]["command"], command)
+        else:
+            self.assertEqual([os.readlink(f"/proc/{pid}/fd/{fd}") for fd in (1, 2)], ["/dev/null"] * 2)
+            self.assertEqual(os.readlink(f"/proc/{pid}/fd/0"), os.readlink(f"/proc/{f.pid}/fd/0"))
 
     def test_null_stdin_capture_preserves_previous_snapshot(self):
         f = self.fixture()
