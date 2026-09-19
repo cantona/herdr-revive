@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.3 — 2026-09-19 (prerelease)
+
+- Keep exact agent sessions across automatic shell-state saves, while manual
+  saves can intentionally clear them. Retry delayed native metadata, refresh
+  capture after waiting, and avoid dropping contending lifecycle events silently.
+- Bypass debounce for agent detection and changed session references; preserve
+  the ordinary debounced-event and exact-ID capture fast paths.
+- Refuse stale native references that conflict with a newly detected explicit
+  resume until matching metadata arrives; preserve in-process session switching.
+- Preserve untouched bare Claude sessions with their assigned UUID by
+  relaunching them with `--session-id`; switch to exact `--resume` as soon as
+  Claude has written a nonempty transcript.
+- Keep `CLAUDE_CONFIG_DIR` unset for standard Claude and preserve its captured
+  `HOME`; retain explicitly selected profiles for launchers such as `claude-local`.
+- Resolve the active Claude profile from the captured process environment and
+  check the canonical project transcript directly on ordinary paths, with a
+  bounded exhaustive fallback for continuation, explicit session-ID selection,
+  and unusual path cases.
+- Resume exact saved agent sessions when Herdr retains stale agent metadata
+  after a restart. The live process tree remains authoritative, so panes with
+  real foreground or background work are still skipped.
+- Add empty-session transition, legacy-snapshot, automatic-startup, regression,
+  and paired pre-fix v0.1.3 performance coverage on macOS and Linux.
+- Omit redundant resume-mode fields and reuse encoded snapshot bytes for
+  history/latest writes, preserving archive IDs and synchronization guarantees.
+
 ## 0.1.2 — 2026-09-19 (prerelease)
 
 - Preserve exact bare-agent sessions when an agent internally redirects

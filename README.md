@@ -106,7 +106,7 @@ On macOS, install Xcode Command Line Tools (`xcode-select --install`) for the li
 Install the tagged source release; Herdr previews the manifest and builds it:
 
 ```sh
-herdr plugin install cantona/herdr-revive --ref v0.1.2
+herdr plugin install cantona/herdr-revive --ref v0.1.3
 herdr plugin config-dir cantona.herdr-revive
 ```
 
@@ -199,6 +199,15 @@ exact session ID, without copying the process environment. Multiple matches or
 duplicate selector keys fail capture. Removing the rule denies old snapshots
 that name the custom launcher. Historical snapshots captured without a rule
 need recapture; the original wrapper cannot be inferred from `claude` alone.
+For an untouched bare Claude session, capture also requires the live
+`CLAUDE_CONFIG_DIR` to match the profile Revive can derive for restoration. Add
+that path to the launcher selector when a wrapper uses a nondefault profile;
+Revive refuses the save rather than risk creating the UUID in the wrong profile.
+The snapshot records the resolved profile path and whether it was explicitly
+selected. Standard Claude restores with its captured `HOME` and
+`CLAUDE_CONFIG_DIR` unset, preserving its normal `~/.claude.json` lookup.
+Explicit profiles, including configured `claude-local` launchers, keep their
+selected `CLAUDE_CONFIG_DIR`.
 
 ## Commands
 
@@ -230,6 +239,14 @@ Manual restores are repeatable requests. Automatic startup/events share one
 claim per server boot and never recreate missing IDs. Missing panes/tabs inside
 an existing workspace are shown as missing; use explicit `--recreate` to make
 a complete new copy. Preview cannot establish shell readiness.
+
+Automatic saves retain the last exact agent session when the same pane, tab,
+workspace and directory temporarily return to a shell. This also applies to
+the timer and `autosave --force`. To intentionally forget that session, use
+manual **Save** while the pane is at its shell prompt. A different captured
+command or directory replaces the retained session; closed panes are not kept.
+Agent detection and changed session IDs bypass debounce. Missing native IDs
+receive a bounded retry; failure leaves the previous snapshot intact.
 
 Actions under `cantona.herdr-revive` are `save`, `preview`, `restore`, `list`,
 `autosave`, `timer`, `manage`, `save-space`, `open-space`, and `delete-space`.
@@ -275,11 +292,15 @@ Intel macOS is compile-checked. Protected/setuid processes (including Apple's
 `top`) may not expose the required metadata. Missing process or configured
 launcher-environment data causes capture to fail and preserves the previous snapshot.
 
-Claude, Codex, Gemini, Copilot and Cursor resume require an exact UUID from a
-matching native reference or explicit resume arguments. Recognized Node package
-wrappers become canonical agent executables on PATH. Original launch flags are
-not inherited; use reviewed `agent_extra_args`. Latest-session, continuation and
-cwd guesses are refused. Unknown detected-agent wrappers fail capture.
+Claude, Codex, Gemini, Copilot and Cursor restoration requires an exact UUID from
+a matching native reference or explicit resume arguments. An untouched bare
+Claude prompt already has a UUID but no resumable transcript; Revive relaunches
+that UUID with `--session-id`, then uses exact `--resume` after Claude writes the
+transcript. This transition is checked in Claude's active profile and does not
+guess a latest session. Recognized Node package wrappers become canonical agent
+executables on PATH. Original launch flags are not inherited; use reviewed
+`agent_extra_args`. Latest-session, continuation and cwd guesses are refused.
+Unknown detected-agent wrappers fail capture.
 
 ## Recovery and safety limits
 
@@ -328,7 +349,7 @@ REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/integration.py
 python3 tests/real_host.py
 REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/openssh.py
 python3 scripts/verify_install.py
-python3 scripts/verify_install.py --github-ref v0.1.2
+python3 scripts/verify_install.py --github-ref v0.1.3
 python3 scripts/benchmark.py --include-cli
 python3 tests/benchmark_contracts.py
 python3 scripts/benchmark_matched.py --baseline ../herdr-resurrect

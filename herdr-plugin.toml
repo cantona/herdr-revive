@@ -1,6 +1,6 @@
 id = "cantona.herdr-revive"
 name = "herdr-revive"
-version = "0.1.2"
+version = "0.1.3"
 min_herdr_version = "0.9.1"
 description = "Save and restore sessions, reusable workspace layouts, and exact agent sessions"
 platforms = ["linux", "macos"]
