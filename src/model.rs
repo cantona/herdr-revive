@@ -1,6 +1,7 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 pub const TOOL: &str = "herdr-revive";
 pub const PLUGIN_ID: &str = "cantona.herdr-revive";
@@ -216,9 +217,30 @@ pub enum CommandSpec {
         executable: String,
         agent: AgentKind,
         session_id: String,
+        #[serde(default, skip_serializing_if = "AgentSessionMode::is_resume")]
+        session_mode: AgentSessionMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_config_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_home: Option<String>,
         #[serde(default, skip_serializing_if = "null_stdio_is_empty")]
         null_stdio: [bool; 3],
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionMode {
+    #[default]
+    #[serde(alias = "legacy")]
+    Resume,
+    Create,
+}
+
+impl AgentSessionMode {
+    fn is_resume(&self) -> bool {
+        *self == Self::Resume
+    }
 }
 
 fn null_stdio_is_empty(null_stdio: &[bool; 3]) -> bool {
@@ -305,6 +327,9 @@ impl CommandSpec {
                 executable,
                 agent,
                 session_id,
+                session_mode,
+                claude_config_dir,
+                claude_home,
                 ..
             } => {
                 validate_program(executable)?;
@@ -312,14 +337,38 @@ impl CommandSpec {
                     ensure!(known == *agent, "agent executable mismatch");
                 }
                 validate_session_id(session_id)?;
+                ensure!(
+                    *session_mode != AgentSessionMode::Create || *agent == AgentKind::Claude,
+                    "new-session launch is only supported for Claude"
+                );
+                ensure!(
+                    (*session_mode == AgentSessionMode::Create) == claude_config_dir.is_some(),
+                    "Claude create mode requires its configuration profile"
+                );
+                if let Some(config_dir) = claude_config_dir {
+                    validate_text(config_dir)?;
+                    ensure!(
+                        Path::new(config_dir).is_absolute(),
+                        "Claude configuration directory must be absolute"
+                    );
+                }
+                if let Some(home) = claude_home {
+                    ensure!(
+                        *session_mode == AgentSessionMode::Create,
+                        "Claude home requires create mode"
+                    );
+                    validate_text(home)?;
+                    ensure!(
+                        Path::new(home).is_absolute(),
+                        "Claude home must be absolute"
+                    );
+                }
                 vec![
                     executable.clone(),
-                    match agent {
-                        AgentKind::Claude
-                        | AgentKind::Gemini
-                        | AgentKind::Copilot
-                        | AgentKind::Cursor => "--resume",
-                        AgentKind::Codex => "resume",
+                    match (agent, session_mode) {
+                        (AgentKind::Claude, AgentSessionMode::Create) => "--session-id",
+                        (AgentKind::Codex, _) => "resume",
+                        _ => "--resume",
                     }
                     .into(),
                     session_id.clone(),
@@ -344,11 +393,21 @@ impl CommandSpec {
     }
     pub fn allowed_argv(&self, config: &Config) -> Result<Vec<String>> {
         let mut argv = self.argv()?;
+        let mut create_profile = None;
         ensure!(
             config.allows(&argv[0]),
             "program is not in current allowlist"
         );
-        if let Self::Agent { agent, .. } = self {
+        if let Self::Agent {
+            executable,
+            agent,
+            session_id,
+            session_mode,
+            claude_config_dir,
+            claude_home,
+            ..
+        } = self
+        {
             ensure!(
                 agent_launcher(std::slice::from_ref(&argv[0])) == Some(*agent)
                     || config.agent_launchers.iter().any(|launcher| {
@@ -360,6 +419,26 @@ impl CommandSpec {
                 config.resume_agents,
                 "agent restoration disabled by current policy"
             );
+            if *agent == AgentKind::Claude && *session_mode == AgentSessionMode::Create {
+                let (current, current_home) = configured_claude_profile(config, executable)?;
+                let captured = Path::new(
+                    claude_config_dir
+                        .as_deref()
+                        .context("Claude create profile is unavailable")?,
+                );
+                ensure!(
+                    current == captured
+                        && current_home.as_deref() == claude_home.as_deref().map(Path::new),
+                    "Claude configuration profile changed or was not captured exactly; recapture before restoring"
+                );
+                let exists = claude_transcript_exists(captured, session_id)?;
+                if exists {
+                    // The first save can race Claude's first transcript write.
+                    // Never create over a conversation that became resumable.
+                    argv[1] = "--resume".into();
+                }
+                create_profile = Some((captured, claude_home.as_deref()));
+            }
             if let Some(extra) = config.agent_extra_args.get(agent.name()) {
                 argv.extend(extra.iter().cloned());
             }
@@ -371,6 +450,20 @@ impl CommandSpec {
                 }),
                 "configured agent launchers require an exact session reference"
             );
+        }
+        if let Some((profile, home)) = create_profile {
+            let mut launch = vec!["/usr/bin/env".into()];
+            if let Some(home) = home {
+                launch.extend([
+                    "-u".into(),
+                    "CLAUDE_CONFIG_DIR".into(),
+                    format!("HOME={home}"),
+                ]);
+            } else {
+                launch.push(format!("CLAUDE_CONFIG_DIR={}", profile.display()));
+            }
+            launch.extend(argv);
+            argv = launch;
         }
         validate_argv(&argv)?;
         if let Some(null_stdio) = self.null_stdio() {
@@ -399,6 +492,128 @@ impl CommandSpec {
             }
             _ => None,
         }
+    }
+}
+
+pub(crate) fn configured_claude_profile(
+    config: &Config,
+    executable: &str,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let configured = config
+        .agent_launchers
+        .iter()
+        .find(|launcher| launcher.agent == AgentKind::Claude && launcher.executable == executable)
+        .and_then(|launcher| launcher.match_env.get("CLAUDE_CONFIG_DIR"))
+        .map(PathBuf::from);
+    let configured =
+        configured.or_else(|| std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from));
+    let (path, home) = if let Some(path) = configured {
+        (path, None)
+    } else {
+        let home = PathBuf::from(std::env::var_os("HOME").context("Claude HOME is unavailable")?);
+        ensure!(home.is_absolute(), "Claude HOME must be absolute");
+        let home = home.canonicalize().context("Claude HOME is inaccessible")?;
+        (home.join(".claude"), Some(home))
+    };
+    ensure!(
+        path.is_absolute(),
+        "Claude configuration directory must be absolute"
+    );
+    Ok((
+        path.canonicalize()
+            .context("Claude configuration directory is inaccessible")?,
+        home,
+    ))
+}
+
+pub fn claude_transcript_exists(config_dir: &Path, session_id: &str) -> Result<bool> {
+    validate_session_id(session_id)?;
+    ensure!(
+        config_dir.is_absolute(),
+        "Claude configuration directory must be absolute"
+    );
+    let projects = config_dir.join("projects");
+    let entries = match std::fs::read_dir(&projects) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("Claude project store is inaccessible"),
+    };
+    let name = format!("{session_id}.jsonl");
+    let mut count = 0usize;
+    for entry in entries {
+        count += 1;
+        ensure!(count <= 4096, "too many Claude project directories");
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        match std::fs::metadata(entry.path().join(&name)) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file(),
+                    "Claude transcript is not a regular file"
+                );
+                if metadata.len() > 0 {
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Claude transcript is inaccessible"),
+        }
+    }
+    Ok(false)
+}
+
+/// Checks the canonical project directory without scanning every Claude project.
+///
+/// Claude replaces each non-ASCII-alphanumeric byte in an ordinary working
+/// directory with `-`. Longer and non-ASCII paths need Claude's collision and
+/// Unicode handling, so callers receive `None` and can use the exhaustive path.
+pub fn claude_project_transcript_exists(
+    config_dir: &Path,
+    cwd: &Path,
+    session_id: &str,
+) -> Result<Option<bool>> {
+    validate_session_id(session_id)?;
+    ensure!(
+        config_dir.is_absolute(),
+        "Claude configuration directory must be absolute"
+    );
+    ensure!(
+        cwd.is_absolute(),
+        "Claude working directory must be absolute"
+    );
+    let cwd = match cwd.to_str() {
+        Some(cwd) if cwd.is_ascii() => cwd,
+        _ => return Ok(None),
+    };
+    let project: String = cwd
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() {
+                char::from(byte)
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if project.len() > 200 {
+        return Ok(None);
+    }
+    let path = config_dir
+        .join("projects")
+        .join(project)
+        .join(format!("{session_id}.jsonl"));
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file(),
+                "Claude transcript is not a regular file"
+            );
+            Ok(Some(metadata.len() > 0))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(false)),
+        Err(error) => Err(error).context("Claude transcript is inaccessible"),
     }
 }
 
@@ -611,7 +826,7 @@ pub struct LivePane {
     pub agent: Option<String>,
     pub agent_session: Option<AgentSession>,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AgentSession {
     pub source: String,
     pub agent: String,

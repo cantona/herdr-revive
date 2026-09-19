@@ -46,8 +46,9 @@ HERDR_PLUGIN_STATE_DIR/spaces/
 ```
 
 The OS releases the exclusive file lock on process exit; no stale-PID-lock
-heuristic or timeout-based lock stealing exists. Hook contention exits as
-`operation_in_progress`; explicit operations report an error. Saves, restores,
+heuristic or timeout-based lock stealing exists. Generic hook contention exits as
+`operation_in_progress`; injected lifecycle events use the bounded wait described
+below. Explicit operations report an error. Saves, restores,
 imports and recovery acknowledgements hold the same session lock. Named-space
 operations also acquire a plugin-wide library lock, after the session lock.
 
@@ -77,6 +78,22 @@ power-cut and disk-full qualification remain release gates.
 A space scope is `{"kind":"space","workspace_id":"w1"}`. A command may
 be null for an idle shell. Agent commands instead use
 `{"kind":"agent","executable":"codex","agent":"codex","session_id":"UUID"}`.
+Captures omit the default resume mode and add `"session_mode":"create"` for
+an untouched bare Claude prompt. Explicit `"session_mode":"resume"` is also
+accepted. Create mode relaunches the exact UUID with
+`--session-id`. Restoration checks again for a nonempty transcript and upgrades
+to `--resume` if the first save raced Claude's first transcript write. The field
+is absent in older snapshots, which retain exact, fail-visible resume semantics.
+Empty-session capture also verifies that the selected `CLAUDE_CONFIG_DIR` can be
+reproduced from current plugin/launcher configuration before saving the mode.
+Create mode includes `claude_config_dir`, binding the saved UUID to that resolved
+absolute profile path. Restore refuses a changed profile, including a retargeted
+symlink. Standard Claude captures additionally include `claude_home`; restore
+preserves that `HOME` and leaves `CLAUDE_CONFIG_DIR` unset using `/usr/bin/env -u`.
+Only captures with an explicitly selected profile set `CLAUDE_CONFIG_DIR` on
+launch. This distinction preserves Claude's default `~/.claude.json` lookup.
+Older Create snapshots missing default-profile provenance require recapture.
+Resume mode omits these profile fields.
 Program stdout/stderr may target `/dev/null` using
 `{"kind":"program_null_stdio","argv":["sleep","60"],"null_stdio":[false,true,false]}`.
 The mask is stdin/stdout/stderr; stdin must remain false and at least one output
@@ -138,6 +155,37 @@ Default manual restore first rehydrates exact existing IDs, then reconstructs
 missing workspaces. Missing panes inside an existing workspace are never guessed
 by position. Automatic hooks do not reconstruct anything. Forced autosave and
 the optional foreground timer are save-only paths and cannot initiate restore.
+
+Automatic saves merge only prior typed agent commands into currently empty
+shell panes with matching pane/workspace/tab IDs and cwd. Manual session and
+named-space saves do not merge. Other foreground commands, changed cwd, and
+removed panes supersede prior entries. Current restore policy is still checked.
+
+Missing native agent metadata may be retried for up to min(timeout_ms, 1000)
+milliseconds, with pane, process, argv/cwd, foreground-tree and session checks.
+After recovering metadata, capture restarts once from a fresh host snapshot and
+process table; another unstable attempt fails without writing. Detection events
+bypass debounce, as do status events whose session or cwd differs from the saved
+entry. Unchanged status events remain debounced.
+For a detection event naming a new invocation, an explicit resume ID that
+conflicts with retained native metadata must be confirmed by a matching native
+report before saving. Timeout preserves the previous snapshot. Ordinary status
+events and manual capture still prefer native metadata over launch argv, since
+an in-process session switch does not change that argv.
+Native references remain dependent on Herdr's freshness guarantees. A bare
+picker with an already-present reference exposes neither an explicit selection
+nor a process-bound session generation; the plugin cannot distinguish an
+inherited reference from a newly selected identical one. It does not infer a
+fresh conversation or replace native authority with launch argv globally.
+
+Real lifecycle events contending for the operation lock retry with bounded
+backoff for up to min(timeout_ms + settle_ms, 60000) milliseconds. After acquiring
+the lock, status events recheck the latest saved session and remain debounced
+when unchanged; other lifecycle events bypass debounce so the preceding save
+cannot swallow a topology or new-invocation event.
+Timeout is a visible error requiring a later event, timer tick or manual autosave;
+there is no unbounded background worker or guarantee of eventual retry without
+one of those triggers. Mutation delivery is never retried by this mechanism.
 
 ## Transport
 

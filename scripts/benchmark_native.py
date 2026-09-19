@@ -30,6 +30,10 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "benchmark-results/native.json")
     parser.add_argument("--baseline-binary", type=Path,
                         help="interleave an existing baseline binary on the same fixtures")
+    parser.add_argument("--include-autosave", action="store_true",
+                        help="also measure forced autosave with existing snapshots")
+    parser.add_argument("--events-only", action="store_true",
+                        help="measure event launches without interleaved save/preview work")
     args = parser.parse_args()
     if args.samples < 30 or any(n < 1 or n > 100 for n in args.panes):
         parser.error("at least 30 samples and pane counts within 1..100 are required")
@@ -48,8 +52,20 @@ def main():
         for count in args.panes:
             print(f"Preparing {count} real mixed panes", flush=True)
             fixtures.append(Fixture(stack, root / str(count), count, root, programs, shell,
-                                    herdr, variants=("rust_direct",)))
-        cases = [(f"{f.count}_{op}", f, op) for f in fixtures for op in ("save", "preview")]
+                                    herdr, variants=tuple(binaries)))
+        # Each binary owns its state directory. Strict newer snapshots may add
+        # fields an older comparison binary intentionally rejects; sharing one
+        # latest.json would benchmark cross-version parsing, not runtime cost.
+        for fixture in fixtures:
+            for variant, binary in binaries.items():
+                fixture.configure(variant, "save")
+                command = fixture.command(variant, "save")
+                command[0] = str(binary)
+                subprocess.run(command, env=fixture.environment(variant), cwd=ROOT,
+                               check=True, capture_output=True, text=True, timeout=60)
+                fixture.verify_save(variant)
+        operations = ("save", "preview", "autosave") if args.include_autosave else ("save", "preview")
+        cases = [] if args.events_only else [(f"{f.count}_{op}", f, op) for f in fixtures for op in operations]
         cases += [(op, fixtures[0], op) for op in ("event_debounced", "event_boot_done")]
         cases = [(f"{variant}_{name}" if args.baseline_binary else name, f, op, variant)
                  for name, f, op in cases for variant in binaries]
@@ -58,9 +74,11 @@ def main():
         random.Random(20260919).shuffle(schedule)
         load_start = os.getloadavg()
         for name, fixture, operation, variant in schedule:
-            fixture.configure("rust_direct", operation)
-            command = fixture.command("rust_direct", operation)
+            fixture.configure(variant, operation)
+            command = fixture.command(variant, operation)
             command[0] = str(binaries[variant])
+            if operation == "autosave":
+                command[1:] = ["autosave", "--force"]
             timing = root / "time.json"
             if sys.platform == "darwin":
                 command = ["/usr/bin/time", "-l", *command]
@@ -68,7 +86,7 @@ def main():
                 command = ["/usr/bin/time", "-f", '{"rss_kib":%M,"user_s":%U,"system_s":%S}',
                            "-o", str(timing), *command]
             start = time.perf_counter_ns()
-            result = subprocess.run(command, env=fixture.environment("rust_direct"), cwd=ROOT,
+            result = subprocess.run(command, env=fixture.environment(variant), cwd=ROOT,
                                     check=True, capture_output=True, text=True, timeout=60)
             elapsed = (time.perf_counter_ns() - start) / 1e6
             if sys.platform == "darwin":
@@ -85,10 +103,10 @@ def main():
                                identity_connections=output["identity_connections"])
             assert measurement["herdr_children"] == 0
             rows[name].append(measurement)
-            if operation == "save":
-                fixture.verify_save("rust_direct")
+            if operation in ("save", "autosave"):
+                fixture.verify_save(variant)
             elif operation == "preview":
-                fixture.verify_preview("rust_direct", result.stdout)
+                fixture.verify_preview(variant, result.stdout)
             else:
                 assert output["result"]["status"] == "debounced"
         assert all(hashlib.sha256(path.read_bytes()).hexdigest() == hashes[name]

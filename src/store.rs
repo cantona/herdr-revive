@@ -226,16 +226,22 @@ impl Store {
             "snapshot session mismatch"
         );
         let path = self.snapshot_path(name)?;
-        if name.is_none() {
+        let archive = if name.is_none() {
             let bytes = serde_json::to_vec(snapshot)?;
-            let archive = self.root.join("snapshots").join(format!(
+            Some(self.root.join("snapshots").join(format!(
                 "{:020}-{}.json",
                 snapshot.created_ms,
                 &digest(&bytes)[..16]
-            ));
-            atomic_json(&archive, snapshot)?;
+            )))
+        } else {
+            None
+        };
+        let bytes = serde_json::to_vec_pretty(snapshot)?;
+        ensure!(bytes.len() <= MAX_BYTES, "output exceeds size limit");
+        if let Some(archive) = archive {
+            atomic_write(&archive, &bytes)?;
         }
-        atomic_json(&path, snapshot)?;
+        atomic_write(&path, &bytes)?;
         if name.is_none() {
             let files = self.list("snapshots")?;
             let remove_count = files.len().saturating_sub(retention);

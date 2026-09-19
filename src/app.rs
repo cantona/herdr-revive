@@ -352,7 +352,26 @@ pub fn run(cli: Cli) -> Result<Value> {
     let store = Store::new(&state_dir, session)?;
     let force_save = matches!(cli.command, Action::Autosave { force: true });
     let hook = matches!(cli.command, Action::Event | Action::Autosave { .. });
-    let Some(_lock) = store.try_lock()? else {
+    let mut acquired = store.try_lock()?;
+    let contended_event =
+        acquired.is_none() && hook && std::env::var_os("HERDR_PLUGIN_EVENT").is_some();
+    // Real lifecycle notifications must not disappear behind a capture that
+    // is still waiting for the very metadata this notification announces.
+    if contended_event {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis((config.timeout_ms + config.settle_ms).min(60_000));
+        let mut pause_ms = 5;
+        while acquired.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+            acquired = store.try_lock()?;
+            pause_ms = (pause_ms * 2).min(50);
+        }
+        ensure!(
+            acquired.is_some(),
+            "lifecycle event could not acquire session lock; retry autosave"
+        );
+    }
+    let Some(_lock) = acquired else {
         if hook {
             return Ok(json!({"status": "operation_in_progress"}));
         }
@@ -412,7 +431,7 @@ pub fn run(cli: Cli) -> Result<Value> {
             dry_run,
             rehydrate,
         )?,
-        Action::Save => save(&mut host, &store, &socket, &config, None, None)?,
+        Action::Save => save(&mut host, &store, &socket, &config, None, None, false)?,
         Action::Event | Action::Autosave { .. } => {
             require_clear(&store)?;
             let generation = platform::generation(&socket)?;
@@ -441,14 +460,18 @@ pub fn run(cli: Cli) -> Result<Value> {
                 let last: Option<SaveTime> = maybe_json(&store.root.join("last-save.json"))?;
                 let now = store::now_ms()?;
                 if !force_save
+                    && (!contended_event
+                        || std::env::var("HERDR_PLUGIN_EVENT").as_deref()
+                            == Ok("pane.agent_status_changed"))
                     && last.is_some_and(|last| {
                         last.generation == generation
                             && now.saturating_sub(last.time_ms) < config.debounce_ms
                     })
+                    && !agent_session_needs_capture(&mut host, &store)?
                 {
                     json!({"status": "debounced"})
                 } else {
-                    save(&mut host, &store, &socket, &config, None, None)?
+                    save(&mut host, &store, &socket, &config, None, None, true)?
                 }
             } else {
                 json!({"status": "boot_done"})
@@ -482,6 +505,7 @@ pub fn run(cli: Cli) -> Result<Value> {
                     &config,
                     Some(&name),
                     Some(&workspace),
+                    false,
                 )?
             }
             SpaceAction::Preview { name }
@@ -547,6 +571,76 @@ struct SaveTime {
     time_ms: u64,
 }
 
+// Only agent lifecycle events need this check. Ordinary debounced events keep
+// their zero-request fast path, and unchanged agent sessions remain debounced.
+fn agent_session_needs_capture(host: &mut impl Host, store: &Store) -> Result<bool> {
+    if std::env::var("HERDR_PLUGIN_EVENT").as_deref() == Ok("pane.agent_detected") {
+        // A new invocation may reuse the UUID but change cwd or launcher.
+        return Ok(true);
+    }
+    if !matches!(
+        std::env::var("HERDR_PLUGIN_EVENT").as_deref(),
+        Ok("pane.agent_detected" | "pane.agent_status_changed")
+    ) {
+        return Ok(false);
+    }
+    let Ok(payload) = std::env::var("HERDR_PLUGIN_EVENT_JSON") else {
+        return Ok(false);
+    };
+    ensure!(
+        payload.len() <= MAX_BYTES,
+        "event payload exceeds size limit"
+    );
+    let payload: Value = serde_json::from_str(&payload).context("invalid agent event payload")?;
+    let Some(id) = payload.pointer("/data/pane_id").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let pane = host.pane(id)?;
+    let Some(native) = pane.agent_session else {
+        // A detection event may precede the session hook. Capture performs a
+        // bounded metadata retry; it never replaces the snapshot on failure.
+        return Ok(pane.agent.is_some());
+    };
+    let Some(previous) = maybe_json::<Snapshot>(&store.snapshot_path(None)?)? else {
+        return Ok(true);
+    };
+    previous.validate()?;
+    ensure!(
+        previous.session == store.session,
+        "cross-session snapshot refused"
+    );
+    Ok(!previous.panes.iter().any(|saved| saved.pane_id == id
+        && saved.workspace_id == pane.workspace_id && saved.tab_id == pane.tab_id
+        && pane.cwd.as_deref().is_some_and(|cwd| cwd == saved.cwd
+            || Path::new(cwd).canonicalize().is_ok_and(|current|
+                Path::new(&saved.cwd).canonicalize().is_ok_and(|old| current == old)))
+        && matches!(&saved.command, Some(CommandSpec::Agent { agent, session_id, .. })
+            if native.source == format!("herdr:{}", agent.name())
+                && native.agent == agent.name() && native.kind == "id" && *session_id == native.value)))
+}
+
+fn retain_autosaved_agents(snapshot: &mut Snapshot, previous: &Snapshot) -> usize {
+    let index: std::collections::HashMap<_, _> = previous
+        .panes
+        .iter()
+        .map(|pane| (pane.pane_id.as_str(), pane))
+        .collect();
+    let mut retained = 0;
+    for pane in &mut snapshot.panes {
+        if pane.command.is_none()
+            && let Some(old) = index.get(pane.pane_id.as_str())
+            && old.workspace_id == pane.workspace_id
+            && old.tab_id == pane.tab_id
+            && old.cwd == pane.cwd
+            && matches!(old.command, Some(CommandSpec::Agent { .. }))
+        {
+            pane.command.clone_from(&old.command);
+            retained += 1;
+        }
+    }
+    retained
+}
+
 fn save(
     host: &mut impl Host,
     store: &Store,
@@ -554,13 +648,26 @@ fn save(
     config: &Config,
     name: Option<&str>,
     workspace: Option<&str>,
+    automatic: bool,
 ) -> Result<Value> {
     require_clear(store)?;
     if let Some(name) = name {
         store::validate_name(name)?;
     }
     let generation = platform::generation(socket)?;
-    let snapshot = capture::capture(host, &store.session, workspace, config)?;
+    let mut snapshot = capture::capture(host, &store.session, workspace, config)?;
+    let mut retained_agents = 0;
+    if automatic
+        && snapshot.panes.iter().any(|pane| pane.command.is_none())
+        && let Some(previous) = maybe_json::<Snapshot>(&store.snapshot_path(None)?)?
+    {
+        previous.validate()?;
+        ensure!(
+            previous.session == store.session,
+            "cross-session snapshot refused"
+        );
+        retained_agents = retain_autosaved_agents(&mut snapshot, &previous);
+    }
     ensure!(
         platform::generation(socket)? == generation,
         "server changed during capture"
@@ -576,7 +683,7 @@ fn save(
         )?;
     }
     Ok(
-        json!({"status": "saved", "panes": snapshot.panes.len(), "path": store.snapshot_path(name)?}),
+        json!({"status": "saved", "panes": snapshot.panes.len(), "retained_agents": retained_agents, "path": store.snapshot_path(name)?}),
     )
 }
 
@@ -714,9 +821,10 @@ fn restore(
                     && Some(&live.terminal_id) == entry.terminal_id.as_ref(),
                 "pane identity changed during restore"
             );
-            if live.agent.is_some() {
-                return Ok(None);
-            }
+            // Agent metadata can survive a Herdr restart after the process has
+            // gone away. Treat the process tree as authoritative: a real
+            // running agent makes the shell non-idle, while a stale label must
+            // not prevent the saved session from being resumed.
             let info = host.process_info(&saved.pane_id)?;
             let Some(shell) = platform::idle_shell(&info)? else {
                 return Ok(None);

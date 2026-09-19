@@ -79,6 +79,9 @@ fn agent_null_output_is_preserved_without_breaking_legacy_snapshots() {
         executable: "codex".into(),
         agent: AgentKind::Codex,
         session_id: id.into(),
+        session_mode: AgentSessionMode::Resume,
+        claude_config_dir: None,
+        claude_home: None,
         null_stdio: [false, false, true],
     };
     assert_eq!(
@@ -92,6 +95,168 @@ fn agent_null_output_is_preserved_without_breaking_legacy_snapshots() {
             "resume",
             id,
         ]
+    );
+    let invalid = CommandSpec::Agent {
+        executable: "codex".into(),
+        agent: AgentKind::Codex,
+        session_id: id.into(),
+        session_mode: AgentSessionMode::Create,
+        claude_config_dir: None,
+        claude_home: None,
+        null_stdio: [false; 3],
+    };
+    assert!(invalid.argv().is_err());
+}
+
+#[test]
+fn legacy_claude_snapshots_fail_visible_and_create_mode_tracks_transcripts() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join("claude-config");
+    std::fs::create_dir(&config_dir).unwrap();
+    let config_dir = config_dir.canonicalize().unwrap();
+    let session = "01234567-89ab-cdef-0123-456789abcdef";
+    let mut cfg = config();
+    cfg.allowed_programs.push("claude-fixture".into());
+    cfg.agent_launchers.push(AgentLauncher {
+        agent: AgentKind::Claude,
+        executable: "claude-fixture".into(),
+        match_env: [("CLAUDE_CONFIG_DIR".into(), config_dir.display().to_string())]
+            .into_iter()
+            .collect(),
+    });
+    let command = |session_mode| CommandSpec::Agent {
+        executable: "claude-fixture".into(),
+        agent: AgentKind::Claude,
+        session_id: session.into(),
+        session_mode,
+        claude_config_dir: (session_mode == AgentSessionMode::Create)
+            .then(|| config_dir.display().to_string()),
+        claude_home: None,
+        null_stdio: [false; 3],
+    };
+    let compact = serde_json::to_value(command(AgentSessionMode::Resume)).unwrap();
+    assert!(compact.get("session_mode").is_none());
+    assert_eq!(
+        serde_json::from_value::<CommandSpec>(compact.clone()).unwrap(),
+        command(AgentSessionMode::Resume),
+    );
+    for mode in ["resume", "legacy"] {
+        let mut explicit = compact.clone();
+        explicit["session_mode"] = mode.into();
+        assert_eq!(
+            serde_json::from_value::<CommandSpec>(explicit).unwrap(),
+            command(AgentSessionMode::Resume),
+        );
+    }
+
+    assert_eq!(
+        command(AgentSessionMode::default())
+            .allowed_argv(&cfg)
+            .unwrap()[1],
+        "--resume"
+    );
+    assert_eq!(
+        command(AgentSessionMode::Create)
+            .allowed_argv(&cfg)
+            .unwrap()[3],
+        "--session-id"
+    );
+    assert_eq!(
+        command(AgentSessionMode::Resume)
+            .allowed_argv(&cfg)
+            .unwrap()[1],
+        "--resume"
+    );
+
+    let project = config_dir.join("projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join(format!("{session}.jsonl")), "{}\n").unwrap();
+    assert_eq!(
+        command(AgentSessionMode::default())
+            .allowed_argv(&cfg)
+            .unwrap()[1],
+        "--resume"
+    );
+    assert_eq!(
+        command(AgentSessionMode::Create)
+            .allowed_argv(&cfg)
+            .unwrap()[3],
+        "--resume"
+    );
+    cfg.agent_launchers[0].match_env.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        temp.path().join("other-profile").display().to_string(),
+    );
+    assert!(
+        command(AgentSessionMode::Create)
+            .allowed_argv(&cfg)
+            .is_err()
+    );
+    let alias = temp.path().join("current-profile");
+    std::os::unix::fs::symlink(&config_dir, &alias).unwrap();
+    cfg.agent_launchers[0]
+        .match_env
+        .insert("CLAUDE_CONFIG_DIR".into(), alias.display().to_string());
+    let argv = command(AgentSessionMode::Create)
+        .allowed_argv(&cfg)
+        .unwrap();
+    assert_eq!(argv[0], "/usr/bin/env");
+    assert_eq!(
+        argv[1],
+        format!("CLAUDE_CONFIG_DIR={}", config_dir.display())
+    );
+    let other = temp.path().join("other-profile");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&other, &alias).unwrap();
+    assert!(
+        command(AgentSessionMode::Create)
+            .allowed_argv(&cfg)
+            .is_err()
+    );
+}
+
+#[test]
+fn claude_project_transcript_lookup_is_direct_and_conservative() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join("claude-config");
+    let cwd = temp.path().join("work.tree");
+    let project: String = cwd
+        .to_str()
+        .unwrap()
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() {
+                char::from(byte)
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let session = "01234567-89ab-cdef-0123-456789abcdef";
+    let transcript = config_dir
+        .join("projects")
+        .join(project)
+        .join(format!("{session}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+
+    assert_eq!(
+        claude_project_transcript_exists(&config_dir, &cwd, session).unwrap(),
+        Some(false)
+    );
+    std::fs::write(&transcript, "{}\n").unwrap();
+    assert_eq!(
+        claude_project_transcript_exists(&config_dir, &cwd, session).unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        claude_project_transcript_exists(&config_dir, Path::new("/tmp/café"), session).unwrap(),
+        None
+    );
+    let long_cwd = Path::new("/").join("a".repeat(201));
+    assert_eq!(
+        claude_project_transcript_exists(&config_dir, &long_cwd, session).unwrap(),
+        None
     );
 }
 
@@ -252,6 +417,20 @@ fn exact_agent_references_only() {
         };
         assert_eq!(
             capture::command_for(&[executable.into()], Some(&native))
+                .unwrap()
+                .unwrap()
+                .argv()
+                .unwrap(),
+            argv
+        );
+        // In-process session changes leave launch argv pointing at the old ID.
+        let old_argv = vec![
+            executable.into(),
+            flag.into(),
+            "11234567-89ab-cdef-0123-456789abcdef".into(),
+        ];
+        assert_eq!(
+            capture::command_for(&old_argv, Some(&native))
                 .unwrap()
                 .unwrap()
                 .argv()
@@ -459,6 +638,15 @@ fn private_atomic_storage_and_retention() {
         let mut snapshot = saved();
         snapshot.created_ms = time;
         s.save(&snapshot, None, 2).unwrap();
+        let compact = serde_json::to_vec(&snapshot).unwrap();
+        let archive = s.root.join("snapshots").join(format!(
+            "{time:020}-{}.json",
+            &store::digest(&compact)[..16],
+        ));
+        assert_eq!(
+            std::fs::read(archive).unwrap(),
+            std::fs::read(s.snapshot_path(None).unwrap()).unwrap(),
+        );
     }
     assert_eq!(s.list("snapshots").unwrap().len(), 2);
     assert_eq!(
@@ -800,6 +988,9 @@ fn configurable_program_matching_and_safe_agent_options() {
         executable: "claude".into(),
         agent: AgentKind::Claude,
         session_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+        session_mode: AgentSessionMode::Resume,
+        claude_config_dir: None,
+        claude_home: None,
         null_stdio: [false; 3],
     };
     assert_eq!(
@@ -880,6 +1071,9 @@ fn custom_agent_launcher_is_selected_by_environment_and_current_policy() {
         executable: selected.executable.clone(),
         agent: AgentKind::Claude,
         session_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+        session_mode: AgentSessionMode::Resume,
+        claude_config_dir: None,
+        claude_home: None,
         null_stdio: [false; 3],
     };
     assert_eq!(cmd.allowed_argv(&cfg).unwrap()[0], "claude-local");

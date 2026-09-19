@@ -22,12 +22,16 @@ BINARY = Path(os.environ.get("REVIVE_BINARY", ROOT / "target/debug/herdr-revive"
 
 
 class Fixture:
-    def __init__(self, transport="direct", panes=1, shell="bash"):
+    def __init__(self, transport="direct", panes=1, shell="bash", default_claude=False):
         # Darwin's default TMPDIR can exceed the Unix socket path limit.
         self.temp = tempfile.TemporaryDirectory(prefix="herdr-revive-test-", dir="/tmp")
         self.root = Path(self.temp.name)
         self.config = self.root / "config"
         self.config.mkdir()
+        self.root.joinpath("claude-config").mkdir()
+        self.default_claude = default_claude
+        if default_claude:
+            self.root.joinpath("home/.claude").mkdir(parents=True)
         self.state = self.root / "state"
         self.socket_path = self.root / "host.sock"
         self.transport = transport
@@ -48,7 +52,10 @@ class Fixture:
         env = os.environ.copy()
         env.update(PATH=str(self.bin_dir) + ":/usr/bin:/bin",
                    REVIVE_TEST_OUTPUT=str(self.root / "argv.json"), PS1="FIXTURE_READY> ",
-                   TERM="dumb")
+                   TERM="dumb", CLAUDE_CONFIG_DIR=str(self.root / "claude-config"))
+        if self.default_claude:
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            env["HOME"] = str(self.root / "home")
         shell_path = shutil.which(shell)
         # This PTY fixture has no terminal emulator to answer ZLE queries.
         shell_args = [shell, "--noprofile", "--norc", "-i"] if shell == "bash" else [shell, "-f", "-i", "+o", "zle"]
@@ -161,7 +168,11 @@ class Fixture:
                    HERDR_PLUGIN_STATE_DIR=str(self.state),
                    HERDR_PLUGIN_ID="cantona.herdr-revive",
                    HERDR_SOCKET_PATH=str(self.socket_path),
-                   HERDR_BIN_PATH=shutil.which("herdr") or "/missing/herdr")
+                   HERDR_BIN_PATH=shutil.which("herdr") or "/missing/herdr",
+                   CLAUDE_CONFIG_DIR=str(self.root / "claude-config"))
+        if self.default_claude:
+            env.pop("CLAUDE_CONFIG_DIR", None)
+            env["HOME"] = str(self.root / "home")
         env.pop("HERDR_SESSION", None)
         return env
 
@@ -375,10 +386,334 @@ class Integration(unittest.TestCase):
                 f = self.fixture()
                 path = f.seed()
                 data = json.loads(path.read_text())
-                data["panes"][0]["command"] = dict(kind="agent",agent=agent,executable=executable,session_id=session)
+                data["panes"][0]["command"] = dict(
+                    kind="agent", agent=agent, executable=executable,
+                    session_id=session, session_mode="resume")
                 path.write_text(json.dumps(data))
                 f.run("restore","--rehydrate")
                 self.assertEqual(f.wait_argv()[1:],["resume" if agent=="codex" else "--resume",session])
+
+    def test_startup_restore_ignores_stale_agent_metadata(self):
+        f = self.fixture()
+        session = "01234567-89ab-cdef-0123-456789abcdef"
+        path = f.seed()
+        data = json.loads(path.read_text())
+        data["panes"][0]["command"] = dict(
+            kind="agent", agent="codex", executable="codex", session_id=session)
+        path.write_text(json.dumps(data))
+        original_pane = f.pane
+        def stale_agent_pane(i=1):
+            pane = original_pane(i)
+            pane["agent"] = "codex"
+            return pane
+        f.pane = stale_agent_pane
+        f.write_config(auto_restore=True)
+        restored = f.run("event")
+        self.assertEqual(restored["result"]["journal"]["entries"][0]["outcome"], "applied")
+        self.assertEqual(f.wait_argv()[1:], ["resume", session])
+
+    def test_empty_bare_claude_reuses_id_until_transcript_exists(self):
+        self.check_empty_claude(default_claude=False)
+
+    def test_autosave_retains_agent_for_startup_but_manual_save_clears_it(self):
+        for agent in ("codex", "claude"):
+            with self.subTest(agent=agent):
+                f = self.fixture()
+                path = f.seed()
+                data = json.loads(path.read_text())
+                command = dict(kind="agent", agent=agent, executable=agent,
+                               session_id="01234567-89ab-cdef-0123-456789abcdef")
+                data["panes"][0]["command"] = command
+                path.write_text(json.dumps(data))
+                self.assertEqual(f.run("autosave", "--force")["result"]["retained_agents"], 1)
+                self.assertEqual(json.loads(path.read_text())["panes"][0]["command"], command)
+                f.write_config(auto_restore=True)
+                self.assertEqual(f.run("event")["result"]["journal"]["entries"][0]["outcome"], "applied")
+                self.assertEqual(f.wait_argv()[1:], ["resume" if agent == "codex" else "--resume", command["session_id"]])
+                f.wait_output(b"FIXTURE_READY>")
+                f.run("save")
+                self.assertIsNone(json.loads(path.read_text())["panes"][0]["command"])
+                self.assertEqual(f.run("autosave", "--force")["result"]["retained_agents"], 0)
+
+    def codex_picker(self, f, session=None):
+        source = f.root / "agent.c"
+        source.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
+        subprocess.run(["cc", str(source), "-o", str(f.bin_dir / "codex")], check=True)
+        os.write(f.master, ("codex resume" + (" " + session if session else "") + "\n").encode())
+        deadline = time.monotonic() + 3
+        while os.tcgetpgrp(f.master) == f.pid:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.01)
+
+    def test_codex_picker_retries_delayed_exact_metadata(self):
+        f = self.fixture()
+        path = f.seed()
+        self.codex_picker(f)
+        original = f.pane
+        ready = time.monotonic() + .2
+        session = "01234567-89ab-cdef-0123-456789abcdef"
+        def pane(i=1):
+            result = original(i)
+            result["agent"] = "codex"
+            if time.monotonic() >= ready:
+                # Topology changes while capture is waiting for the hook.
+                f.panes = 2
+                result["agent_session"] = dict(source="herdr:codex", agent="codex", kind="id", value=session)
+            return result
+        f.pane = pane
+        f.run("save")
+        self.assertEqual(json.loads(path.read_text())["panes"][0]["command"]["session_id"], session)
+        self.assertEqual(len(json.loads(path.read_text())["panes"]), 2)
+
+    def test_codex_metadata_timeout_preserves_snapshot(self):
+        f = self.fixture()
+        path = f.seed()
+        before = path.read_bytes()
+        f.write_config(timeout_ms=100)
+        self.codex_picker(f)
+        failed = f.run("autosave", "--force", ok=False)
+        self.assertIn("metadata did not arrive", failed.stderr)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_new_codex_invocation_waits_for_conflicting_native_session(self):
+        for confirmed in (False, True):
+            with self.subTest(confirmed=confirmed):
+                f = self.fixture()
+                path = f.seed()
+                before = path.read_bytes()
+                f.write_config(auto_save=True, timeout_ms=300)
+                session = "11234567-89ab-cdef-0123-456789abcdef"
+                self.codex_picker(f, session)
+                original = f.pane
+                ready = time.monotonic() + .15
+                def pane(i=1):
+                    result = original(i)
+                    value = session if confirmed and time.monotonic() >= ready else "01234567-89ab-cdef-0123-456789abcdef"
+                    result.update(agent="codex", agent_session=dict(
+                        source="herdr:codex", agent="codex", kind="id", value=value))
+                    return result
+                f.pane = pane
+                original_env = f.env
+                def env():
+                    result = original_env()
+                    result.update(HERDR_PLUGIN_EVENT="pane.agent_detected",
+                                  HERDR_PLUGIN_EVENT_JSON=json.dumps(dict(data=dict(pane_id="w1:p1"))))
+                    return result
+                f.env = env
+                if confirmed:
+                    self.assertEqual(f.run("event")["result"]["status"], "saved")
+                    self.assertEqual(json.loads(path.read_text())["panes"][0]["command"]["session_id"], session)
+                else:
+                    self.assertIn("conflicts with retained", f.run("event", ok=False).stderr)
+                    self.assertEqual(path.read_bytes(), before)
+
+    def test_agent_session_change_bypasses_debounce_but_unchanged_does_not(self):
+        f = self.fixture()
+        path = f.seed()
+        f.write_config(auto_save=True)
+        self.codex_picker(f)
+        original = f.pane
+        session = ["01234567-89ab-cdef-0123-456789abcdef"]
+        def pane(i=1):
+            result = original(i)
+            result.update(agent="codex", agent_session=dict(
+                source="herdr:codex", agent="codex", kind="id", value=session[0]))
+            return result
+        f.pane = pane
+        original_env = f.env
+        def env():
+            result = original_env()
+            result.update(HERDR_PLUGIN_EVENT="pane.agent_status_changed",
+                          HERDR_PLUGIN_EVENT_JSON=json.dumps(dict(data=dict(pane_id="w1:p1"))))
+            return result
+        f.env = env
+        self.assertEqual(f.run("event")["result"]["status"], "saved")
+        self.assertEqual(f.run("event")["result"]["status"], "debounced")
+        # Queued status notifications must recheck the saved state after the
+        # writer releases its lock, not each produce a redundant full save.
+        import fcntl
+        with (path.parent / "operation.lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                pending = [pool.submit(f.run, "event") for _ in range(3)]
+                time.sleep(.2)
+                self.assertTrue(all(not task.done() for task in pending))
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                for task in pending:
+                    self.assertEqual(task.result(timeout=3)["result"]["status"], "debounced")
+        status_env = f.env
+        def detected_env():
+            result = status_env()
+            result["HERDR_PLUGIN_EVENT"] = "pane.agent_detected"
+            return result
+        f.env = detected_env
+        self.assertEqual(f.run("event")["result"]["status"], "saved")
+        f.env = status_env
+        session[0] = "11234567-89ab-cdef-0123-456789abcdef"
+        self.assertEqual(f.run("event")["result"]["status"], "saved")
+        self.assertEqual(json.loads(path.read_text())["panes"][0]["command"]["session_id"], session[0])
+
+    def test_metadata_retry_refuses_replaced_pane(self):
+        f = self.fixture()
+        path = f.seed()
+        before = path.read_bytes()
+        self.codex_picker(f)
+        original = f.pane
+        calls = [0]
+        def pane(i=1):
+            result = original(i)
+            calls[0] += 1
+            if calls[0] > 1:
+                result["terminal_id"] = "replacement"
+            return result
+        f.pane = pane
+        self.assertIn("pane changed", f.run("save", ok=False).stderr)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_contending_lifecycle_event_waits_then_saves_without_debounce(self):
+        import fcntl
+        f = self.fixture()
+        path = f.seed()
+        f.write_config(auto_save=True)
+        original_env = f.env
+        def env():
+            result = original_env()
+            result["HERDR_PLUGIN_EVENT"] = "workspace.created"
+            return result
+        f.env = env
+        with (path.parent / "operation.lock").open("r+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                pending = pool.submit(f.run, "event")
+                time.sleep(.2)
+                self.assertFalse(pending.done())
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                self.assertEqual(pending.result(timeout=3)["result"]["status"], "saved")
+
+    def test_autosave_does_not_retain_agent_after_cwd_change(self):
+        f = self.fixture()
+        path = f.seed()
+        data = json.loads(path.read_text())
+        data["panes"][0]["command"] = dict(kind="agent", agent="codex", executable="codex",
+            session_id="01234567-89ab-cdef-0123-456789abcdef")
+        data["panes"][0]["cwd"] = "/different-project"
+        path.write_text(json.dumps(data))
+        self.assertEqual(f.run("autosave", "--force")["result"]["retained_agents"], 0)
+        self.assertIsNone(json.loads(path.read_text())["panes"][0]["command"])
+
+    def test_standard_claude_preserves_unset_config_dir_and_home(self):
+        self.check_empty_claude(default_claude=True)
+
+    def test_empty_claude_local_keeps_explicit_profile(self):
+        self.check_empty_claude(default_claude=False, local_launcher=True)
+
+    def check_empty_claude(self, default_claude, local_launcher=False):
+        f = self.fixture(default_claude=default_claude)
+        profile = f.root / ("home/.claude" if default_claude else "claude-config")
+        if local_launcher:
+            f.write_config(allowed_programs=["claude", "claude-local"])
+            with (f.config / "config.toml").open("a") as config:
+                config.write('\n[[agent_launchers]]\nagent = "claude"\nexecutable = "claude-local"\nmatch_env = { CLAUDE_CONFIG_DIR = ' + json.dumps(str(profile)) + ' }\n')
+        session = "01234567-89ab-cdef-0123-456789abcdef"
+        original_pane = f.pane
+        def claude_pane(i=1):
+            pane = original_pane(i)
+            if os.tcgetpgrp(f.master) != f.pid:
+                pane.update(agent="claude", agent_session=dict(
+                    source="herdr:claude", agent="claude", kind="id", value=session))
+            return pane
+        f.pane = claude_pane
+        source = f.root / "agent.c"
+        source.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
+        subprocess.run(["cc", str(source), "-o", str(f.bin_dir / "claude")], check=True)
+        os.write(f.master, b"claude\n")
+        deadline = time.monotonic() + 3
+        while os.tcgetpgrp(f.master) == f.pid and time.monotonic() < deadline:
+            time.sleep(0.01)
+        path = Path(f.run("save")["result"]["path"])
+        command = json.loads(path.read_text())["panes"][0]["command"]
+        self.assertEqual(command["session_mode"], "create")
+        self.assertEqual(command["executable"], "claude-local" if local_launcher else "claude")
+        self.assertEqual(command["claude_config_dir"], str(profile.resolve()))
+        if default_claude:
+            self.assertEqual(command["claude_home"], str((f.root / "home").resolve()))
+            data = json.loads(path.read_text())
+            data["panes"][0]["command"].pop("claude_home")
+            path.write_text(json.dumps(data))
+            self.assertEqual(f.run("preview")["result"]["plan"]["entries"][0]["decision"], "denied_by_policy")
+            data["panes"][0]["command"] = command
+            path.write_text(json.dumps(data))
+        else:
+            self.assertNotIn("claude_home", command)
+        os.write(f.master, b"\x03")
+        f.wait_output(b"FIXTURE_READY>")
+        shutil.copy2(f.bin_dir / "codex", f.bin_dir / "claude")
+        with (f.bin_dir / "claude").open("a") as executable:
+            executable.write("with open(os.environ['REVIVE_TEST_OUTPUT'] + '.profile', 'w') as f:\n json.dump(dict(home=os.environ.get('HOME'), config_dir=os.environ.get('CLAUDE_CONFIG_DIR')), f)\n")
+        if local_launcher:
+            shutil.copy2(f.bin_dir / "claude", f.bin_dir / "claude-local")
+        os.write(f.master, b"export HOME=/wrong-home CLAUDE_CONFIG_DIR=/wrong-profile\n" if default_claude else b"unset CLAUDE_CONFIG_DIR\n")
+        f.wait_output(b"FIXTURE_READY>")
+        f.run("restore", "--rehydrate")
+        self.assertEqual(f.wait_argv()[1:], ["--session-id", session])
+        f.wait_output(b"FIXTURE_READY>")
+        restored_profile = json.loads(f.root.joinpath("argv.json.profile").read_text())
+        self.assertEqual(restored_profile["config_dir"], None if default_claude else command["claude_config_dir"])
+        if default_claude:
+            self.assertEqual(restored_profile["home"], command["claude_home"])
+        f.root.joinpath("argv.json").unlink()
+        data = json.loads(path.read_text())
+        data["panes"][0]["command"].pop("session_mode")
+        data["panes"][0]["command"].pop("claude_config_dir")
+        data["panes"][0]["command"].pop("claude_home", None)
+        path.write_text(json.dumps(data))
+        f.run("restore", "--rehydrate")
+        self.assertEqual(f.wait_argv()[1:], ["--resume", session])
+        f.wait_output(b"FIXTURE_READY>")
+        f.root.joinpath("argv.json").unlink()
+        data["panes"][0]["command"] = command
+        path.write_text(json.dumps(data))
+        project = profile / "projects" / "fixture"
+        project.mkdir(parents=True)
+        project.joinpath(f"{session}.jsonl").write_text("{}\n")
+        f.run("restore", "--rehydrate")
+        self.assertEqual(f.wait_argv()[1:], ["--resume", session])
+
+    def test_empty_claude_refuses_an_unreproducible_profile(self):
+        f = self.fixture()
+        previous = f.seed().read_bytes()
+        session = "01234567-89ab-cdef-0123-456789abcdef"
+        original_pane = f.pane
+        def claude_pane(i=1):
+            pane = original_pane(i)
+            if os.tcgetpgrp(f.master) != f.pid:
+                pane.update(agent="claude", agent_session=dict(
+                    source="herdr:claude", agent="claude", kind="id", value=session))
+            return pane
+        f.pane = claude_pane
+        with (f.config / "config.toml").open("a") as config:
+            config.write('\n[[agent_launchers]]\nagent = "claude"\nexecutable = "claude-work"\nmatch_env = { PROFILE = "work" }\n')
+        source = f.root / "agent.c"
+        source.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
+        subprocess.run(["cc", str(source), "-o", str(f.bin_dir / "claude")], check=True)
+        profile = f.root / "work-profile"
+        profile.mkdir()
+        os.write(f.master, f"PROFILE=work CLAUDE_CONFIG_DIR={profile} claude\n".encode())
+        deadline = time.monotonic() + 3
+        while os.tcgetpgrp(f.master) == f.pid and time.monotonic() < deadline:
+            time.sleep(0.01)
+        result = f.run("save", ok=False)
+        self.assertIn("profile cannot be reproduced", result.stderr)
+        latest = next(f.state.glob("*/latest.json"))
+        self.assertEqual(latest.read_bytes(), previous)
+        project_name = "".join(ch if ch.isascii() and ch.isalnum() else "-" for ch in str(f.root.resolve()))
+        project = profile / "projects" / project_name
+        project.mkdir(parents=True)
+        project.joinpath(f"{session}.jsonl").write_text("{}\n")
+        path = Path(f.run("save")["result"]["path"])
+        command = json.loads(path.read_text())["panes"][0]["command"]
+        self.assertNotIn("session_mode", command)
+        self.assertNotIn("claude_config_dir", command)
 
     def test_wrong_session_full_snapshot_is_rejected(self):
         source = self.fixture()
@@ -414,7 +749,9 @@ class Integration(unittest.TestCase):
         path = Path(f.run("save")["result"]["path"])
         content = path.read_text()
         command = json.loads(content)["panes"][0]["command"]
-        self.assertEqual(command, dict(kind="agent", agent="claude", executable="claude-local", session_id=session))
+        self.assertEqual(command, dict(
+            kind="agent", agent="claude", executable="claude-local",
+            session_id=session))
         self.assertNotIn("never-save", content)
         self.assertNotIn("/fixture/local", content)
         os.write(f.master, b"\x03")

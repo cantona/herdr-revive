@@ -161,7 +161,7 @@ class RealHost(unittest.TestCase):
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 info = self.api("pane.process_info", dict(pane_id=pane))["process_info"]
-                if any(p.get("name") == name for p in info["foreground_processes"]):
+                if any(p.get("name") == name for p in info.get("foreground_processes", [])):
                     return info
                 time.sleep(0.05)
             self.fail(f"{name} did not start: {info}")
@@ -362,7 +362,13 @@ class RealHost(unittest.TestCase):
         pane = created["root_pane"]["pane_id"]
         time.sleep(0.1)
         self.api("pane.send_input",dict(pane_id=pane,text="/bin/sleep 60",keys=["Enter"]))
-        time.sleep(0.1)
+        deadline = time.monotonic() + 5
+        while True:
+            info = self.api("pane.process_info", dict(pane_id=pane))["process_info"]
+            if ["/bin/sleep", "60"] in [p.get("argv", []) for p in info["foreground_processes"]]:
+                break
+            self.assertLess(time.monotonic(), deadline, info)
+            time.sleep(0.02)
         self.run_cli("save")
         self.config.write_text('auto_restore = true\nsettle_ms = 100\nallowed_programs = ["/bin/sleep"]\n')
         time.sleep(0.3)
@@ -379,11 +385,61 @@ class RealHost(unittest.TestCase):
                 self.assertLess(time.monotonic(),deadline)
                 time.sleep(0.05)
         result = self.run_cli("event")
-        self.assertEqual(result["result"]["journal"]["entries"][0]["outcome"],"applied")
+        self.assertEqual(result["result"]["journal"]["entries"][0]["outcome"],"applied", result)
         time.sleep(0.1)
         info = self.api("pane.process_info",dict(pane_id=pane))["process_info"]
         self.assertIn(["/bin/sleep","60"],[p["argv"] for p in info["foreground_processes"]])
         self.assertEqual(self.run_cli("event")["result"]["status"],"boot_done")
+
+    def test_autosave_after_codex_exit_preserves_session_across_restart(self):
+        source = self.root / "agent.c"
+        source.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
+        executable = self.root / "codex"
+        subprocess.run(["cc", str(source), "-o", str(executable)], check=True)
+        session = "01234567-89ab-cdef-0123-456789abcdef"
+        argv = [str(executable), "resume", session]
+        self.config.write_text('auto_restore = true\nsettle_ms = 100\nmatch_program_basename = true\nallowed_programs = ["codex"]\n')
+        created = self.api("workspace.create", dict(label="Codex lifecycle", cwd=str(self.root), focus=False))
+        pane = created["root_pane"]["pane_id"]
+        import shlex
+        self.api("pane.send_input", dict(pane_id=pane, text=shlex.join(argv), keys=["Enter"]))
+
+        def wait_process(expected):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                info = self.api("pane.process_info", dict(pane_id=pane))["process_info"]
+                for process in info.get("foreground_processes", []):
+                    if expected is not None and process.get("argv") == expected:
+                        return process["pid"]
+                if expected is None and info.get("foreground_process_group_id") == info.get("shell_pid"):
+                    return info["shell_pid"]
+                time.sleep(.02)
+            self.fail(f"foreground process not ready: {info}")
+
+        pid = wait_process(argv)
+        path = Path(self.run_cli("save")["result"]["path"])
+        saved = json.loads(path.read_text())["panes"][0]["command"]
+        os.kill(pid, signal.SIGTERM)
+        wait_process(None)
+        self.assertEqual(self.run_cli("autosave", "--force")["result"]["retained_agents"], 1)
+        self.assertEqual(json.loads(path.read_text())["panes"][0]["command"], saved)
+        Path(self.env["HERDR_CONFIG_PATH"]).write_text('[session]\nresume_agents_on_restore = false\n')
+        time.sleep(.3)
+        self.server.terminate()
+        self.server.wait(timeout=5)
+        self.server = subprocess.Popen([HERDR, "server"], env=self.env, cwd=self.root, stdout=self.log, stderr=self.log)
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                with socket.socket(socket.AF_UNIX) as connection:
+                    connection.connect(self.env["HERDR_SOCKET_PATH"])
+                break
+            except OSError:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.05)
+        restored = self.run_cli("event")
+        self.assertEqual(restored["result"]["journal"]["entries"][0]["outcome"], "applied")
+        self.assertNotEqual(wait_process(argv), pid)
 
     def test_restart_preserves_custom_agent_launcher_without_native_resume(self):
         source = self.root / "agent.c"
