@@ -596,10 +596,23 @@ fn agent_session_needs_capture(host: &mut impl Host, store: &Store) -> Result<bo
         return Ok(false);
     };
     let pane = host.pane(id)?;
+    // Capture saves an agent revive cannot resume as a plain program, so its
+    // events have no session to catch up on and stay debounced; bypassing for
+    // them would write a snapshot per status change and rotate the retained
+    // ones out. The live agent decides: herdr keeps a session after its agent
+    // exits and even after another agent starts in the pane, so the session's
+    // name counts only when no agent is running.
+    let agent = pane.agent.as_deref().or(pane
+        .agent_session
+        .as_ref()
+        .map(|session| session.agent.as_str()));
+    if agent.and_then(AgentKind::from_name).is_none() {
+        return Ok(false);
+    }
     let Some(native) = pane.agent_session else {
         // A detection event may precede the session hook. Capture performs a
         // bounded metadata retry; it never replaces the snapshot on failure.
-        return Ok(pane.agent.is_some());
+        return Ok(true);
     };
     let Some(previous) = maybe_json::<Snapshot>(&store.snapshot_path(None)?)? else {
         return Ok(true);

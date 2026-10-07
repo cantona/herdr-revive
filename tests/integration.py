@@ -281,6 +281,61 @@ class Integration(unittest.TestCase):
         self.assertEqual(Path(saved["cwd"]), f.root.resolve())
         self.assertFalse((f.root / "WRONG").exists())
 
+    def start_foreground_job(self, f, name):
+        source = f.root / "wait.c"
+        source.write_text('#include <unistd.h>\nint main(void) { for (;;) pause(); }\n')
+        program = f.bin_dir / name
+        subprocess.run(["cc", str(source), "-o", str(program)], check=True)
+        os.write(f.master, (shlex.quote(str(program)) + "\n").encode())
+        deadline = time.monotonic() + 3
+        while os.tcgetpgrp(f.master) == f.pid and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        return str(program)
+
+    def test_pane_reporting_an_agent_revive_does_not_restore_is_saved_as_a_program(self):
+        # herdr-file-annotator's review pane reports itself as agent "annotator".
+        f = self.fixture()
+        program = self.start_foreground_job(f, "herdr-annotator")
+        original = f.pane
+        f.pane = lambda i=1: dict(original(i), agent="annotator", agent_status="blocked")
+        saved = json.loads(Path(f.run("save")["result"]["path"]).read_text())["panes"][0]
+        self.assertEqual(saved["command"], dict(kind="program", argv=[program]))
+
+    def test_status_events_of_an_agent_revive_does_not_resume_are_debounced(self):
+        # Each bypassed event writes a snapshot; enough of them would rotate every
+        # retained restore point out of snapshots/.
+        # herdr also records sessions for agents revive cannot resume (droid), and
+        # keeps a claude session when another agent starts in the pane (grok).
+        def session(agent):
+            return dict(source=f"herdr:{agent}", agent=agent, kind="id",
+                        value="01234567-89ab-cdef-0123-456789abcdef")
+        for program, fields in (("herdr-annotator", dict(agent="annotator")),
+                                ("droid", dict(agent="droid", agent_session=session("droid"))),
+                                ("grok", dict(agent="grok", agent_session=session("claude")))):
+            with self.subTest(program=program):
+                f = self.fixture()
+                self.start_foreground_job(f, program)
+                f.write_config(auto_save=True)
+                original = f.pane
+                f.pane = lambda i=1, original=original, fields=fields: dict(
+                    original(i), agent_status="idle", **fields)
+                original_env = f.env
+                f.env = lambda original_env=original_env: dict(
+                    original_env(), HERDR_PLUGIN_EVENT="pane.agent_status_changed",
+                    HERDR_PLUGIN_EVENT_JSON=json.dumps(dict(data=dict(pane_id="w1:p1"))))
+                self.assertEqual(f.run("event")["result"]["status"], "saved")
+                for _ in range(3):
+                    self.assertEqual(f.run("event")["result"]["status"], "debounced")
+
+    def test_restorable_agent_behind_an_unknown_launcher_fails_the_save(self):
+        f = self.fixture()
+        self.start_foreground_job(f, "claude-wrapper")
+        original = f.pane
+        f.pane = lambda i=1: dict(original(i), agent="claude", agent_status="idle")
+        failed = f.run("save", ok=False)
+        self.assertIn("unsupported launcher", failed.stderr)
+
     def test_any_host_version_with_unknown_fields_saves_and_restores(self):
         for transport, protocol in (("direct", 99), ("cli", None)):
             with self.subTest(transport=transport):

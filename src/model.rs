@@ -257,6 +257,18 @@ pub enum AgentKind {
 }
 
 impl AgentKind {
+    pub const ALL: [Self; 5] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Gemini,
+        Self::Copilot,
+        Self::Cursor,
+    ];
+
+    /// The kind herdr reports as a pane's `agent`, if revive can resume it.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
     pub fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",

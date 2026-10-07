@@ -100,7 +100,11 @@ fn capture_once(
                 null_stdio[1] = false;
             }
             cwd = process_cwd;
-            if pane.agent.is_some() && agent_launcher(&argv).is_none() {
+            // Only an agent revive can resume must come from a launcher it can
+            // parse; a pane reporting some other agent (the file-annotator review
+            // pane reports "annotator") is captured as the program it runs.
+            let resumable = pane.agent.as_deref().and_then(AgentKind::from_name);
+            if resumable.is_some() && agent_launcher(&argv).is_none() {
                 anyhow::bail!(
                     "detected agent uses an unsupported launcher; exact resume cannot be established"
                 );
