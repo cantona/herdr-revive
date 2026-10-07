@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4 — 2026-10-07 (prerelease)
+
+- Accept every Herdr release from `min_herdr_version` (0.9.1) onward. The
+  runtime no longer refuses hosts other than 0.9.1 / protocol 22; on Herdr
+  0.9.3 that check failed startup and lifecycle events, so autosave and the
+  startup restore stopped without a visible error. Herdr enforces the minimum
+  version at install and link time.
+
 ## 0.1.3 — 2026-09-19 (prerelease)
 
 - Keep exact agent sessions across automatic shell-state saves, while manual
