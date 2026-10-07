@@ -34,6 +34,7 @@ fn capture_once(
         );
     }
     let table = platform::process_table()?;
+    let mut listings = ClaudeListings::default();
     let mut panes = Vec::new();
     for pane in live
         .panes
@@ -109,8 +110,30 @@ fn capture_once(
                     "detected agent uses an unsupported launcher; exact resume cannot be established"
                 );
             }
-            let (mut command, native_session, refreshed) =
-                command_with_metadata_retry(host, pane, identity, &argv, &cwd, config)?;
+            // A resolved attach names the session its client opened. herdr's
+            // record for such a pane comes from the daemon's hooks, which report
+            // to whichever pane started the daemon, so it does not override the
+            // attach. Unresolved, herdr's record is used as before when present.
+            let attached = match resolve_claude_attach(
+                &argv,
+                identity,
+                &mut listings,
+                std::time::Duration::from_millis(config.timeout_ms),
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) if pane.agent_session.is_some() => {
+                    eprintln!(
+                        "herdr-revive: warning: pane {}: {error:#}; using herdr's session record",
+                        pane.pane_id
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            let (mut command, native_session, refreshed) = match &attached {
+                Some(resolved) => (command_for(resolved, None)?, false, false),
+                None => command_with_metadata_retry(host, pane, identity, &argv, &cwd, config)?,
+            };
             if refreshed {
                 return Ok(None);
             }
@@ -129,8 +152,9 @@ fn capture_once(
                     .iter()
                     .filter(|launcher| launcher.agent == *agent)
                     .collect();
-                let detect_empty_claude =
-                    *agent == AgentKind::Claude && native_session && !has_explicit_resume(&argv);
+                let detect_empty_claude = *agent == AgentKind::Claude
+                    && (native_session || attached.is_some())
+                    && !has_explicit_resume(&argv);
                 let environment = if !launchers.is_empty() || detect_empty_claude {
                     Some(platform::environment(identity)?)
                 } else {
@@ -148,14 +172,19 @@ fn capture_once(
                             .as_deref()
                             .context("Claude environment is unavailable")?,
                     )?;
-                    let transcript_exists = claude_project_transcript_exists(
-                        &config_dir,
-                        std::path::Path::new(&cwd),
-                        session_id,
-                    )?;
-                    let transcript_exists = match transcript_exists {
-                        Some(exists) if exists || !has_implicit_resume(&argv) => exists,
-                        _ => claude_transcript_exists(&config_dir, session_id)?,
+                    // An attach can be typed in any directory, so its session's
+                    // transcript need not be under the pane's cwd project.
+                    let transcript_exists = if attached.is_some() {
+                        claude_transcript_exists(&config_dir, session_id)?
+                    } else {
+                        match claude_project_transcript_exists(
+                            &config_dir,
+                            std::path::Path::new(&cwd),
+                            session_id,
+                        )? {
+                            Some(exists) if exists || !has_implicit_resume(&argv) => exists,
+                            _ => claude_transcript_exists(&config_dir, session_id)?,
+                        }
                     };
                     if !transcript_exists {
                         let (configured_dir, configured_home) =
@@ -396,6 +425,216 @@ fn has_explicit_resume(argv: &[String]) -> bool {
                 .strip_prefix("-r")
                 .is_some_and(|id| validate_session_id(id).is_ok())
     })
+}
+
+/// A Claude session handed off to the background is reopened as
+/// `claude attach <id>`, where `<id>` is the short id `claude agents --json`
+/// lists. Map it to the exact session and return the invocation as
+/// `--resume <uuid>`, which reattaches while the session still runs in the
+/// background and resumes it once stopped. A name instead of an id is refused:
+/// attach matches names by substring, so it does not identify one session.
+/// The listing is per Claude profile, so it is read with the pane process's
+/// CLAUDE_CONFIG_DIR and HOME, and with --all so a session whose background
+/// process has ended is still found while its attach client stays open.
+pub fn resolve_claude_attach(
+    argv: &[String],
+    identity: &platform::Process,
+    listings: &mut ClaudeListings,
+    timeout: std::time::Duration,
+) -> Result<Option<Vec<String>>> {
+    if agent_launcher(argv) != Some(AgentKind::Claude) {
+        return Ok(None);
+    }
+    let start = if is_launcher(&argv[0]) { 2 } else { 1 };
+    let args = &argv[start..];
+    if args.first().map(String::as_str) != Some("attach") {
+        return Ok(None);
+    }
+    ensure!(
+        args.len() == 2,
+        "claude attach must name exactly one session"
+    );
+    let id = &args[1];
+    let session = if validate_session_id(id).is_ok() {
+        id.clone()
+    } else {
+        ensure!(
+            id.len() == 8 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "claude attach by name cannot be resolved to an exact session"
+        );
+        let environment = platform::environment(identity)?;
+        let profile: Vec<(&str, Option<Vec<u8>>)> = ["CLAUDE_CONFIG_DIR", "HOME"]
+            .into_iter()
+            .map(|key| {
+                Ok((
+                    key,
+                    environment_value(&environment, key)?.map(<[u8]>::to_vec),
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let mut program = argv[..start].to_vec();
+        program[0] = on_pane_path(&program[0], environment_value(&environment, "PATH")?)?;
+        let listing = listings
+            .get(&program, &profile, timeout)
+            .context("claude agents --json --all")?;
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_slice(listing).context("invalid claude agents listing")?;
+        let mut sessions: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry["id"].as_str() == Some(id.as_str()))
+            .filter_map(|entry| entry["sessionId"].as_str())
+            .collect();
+        sessions.sort_unstable();
+        sessions.dedup();
+        ensure!(
+            sessions.len() == 1,
+            "claude agents lists {} sessions for attach id {id}",
+            sessions.len()
+        );
+        sessions[0].to_owned()
+    };
+    validate_session_id(&session)?;
+    let mut resolved = argv[..start].to_vec();
+    resolved.extend(["--resume".to_owned(), session]);
+    Ok(Some(resolved))
+}
+
+/// A bare program name is looked up on the pane's PATH, not revive's: herdr
+/// may run plugins with a PATH that lacks the user's own bin directories.
+/// Relative PATH entries are skipped, since they name the pane's cwd.
+fn on_pane_path(name: &str, path: Option<&[u8]>) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    if name.contains('/') {
+        return Ok(name.to_owned());
+    }
+    let path = path.with_context(|| format!("pane has no PATH to find {name} on"))?;
+    for dir in path.split(|byte| *byte == b':') {
+        let dir = std::path::Path::new(std::ffi::OsStr::from_bytes(dir));
+        if !dir.is_absolute() {
+            continue;
+        }
+        let candidate = dir.join(name);
+        if candidate
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        {
+            return candidate
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("{name} resolves to a non-UTF-8 path"));
+        }
+    }
+    anyhow::bail!("{name} is not on the pane's PATH")
+}
+
+type Profile<'a> = [(&'a str, Option<Vec<u8>>)];
+type ListingKey = (Vec<String>, Vec<(String, Option<Vec<u8>>)>);
+
+/// Listings already read during one capture pass. Each query costs a process
+/// spawn while the session lock is held and attach panes usually share one
+/// profile, so a pass reads each launcher and profile once. The cache must not
+/// outlive the pass: the timer captures repeatedly in one process, and a session
+/// handed off after an earlier pass would be missing from a stale listing.
+#[derive(Default)]
+pub struct ClaudeListings(Vec<(ListingKey, Vec<u8>)>);
+
+impl ClaudeListings {
+    fn get(
+        &mut self,
+        program: &[String],
+        profile: &Profile,
+        timeout: std::time::Duration,
+    ) -> Result<&[u8]> {
+        let key: ListingKey = (
+            program.to_vec(),
+            profile
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+        );
+        let index = match self.0.iter().position(|(cached, _)| *cached == key) {
+            Some(index) => index,
+            None => {
+                let listing =
+                    run_bounded(program, &["agents", "--json", "--all"], profile, timeout)?;
+                self.0.push((key, listing));
+                self.0.len() - 1
+            }
+        };
+        Ok(&self.0[index].1)
+    }
+}
+
+/// Runs a short read-only query and returns its stdout, killing it past the
+/// deadline. HERDR_* is stripped: if the query starts Claude's daemon, the
+/// daemon must not inherit this plugin's pane and report sessions to it.
+/// `profile` sets each variable to the pane's value, or removes it when the
+/// pane had none.
+fn run_bounded(
+    program: &[String],
+    args: &[&str],
+    profile: &Profile,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut command = std::process::Command::new(&program[0]);
+    command.args(&program[1..]).args(args);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("HERDR_") {
+            command.env_remove(key);
+        }
+    }
+    for (key, value) in profile {
+        match value {
+            Some(value) => command.env(key, std::ffi::OsStr::from_bytes(value)),
+            None => command.env_remove(key),
+        };
+    }
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("cannot start {}", program[0]))?;
+    let result = (|| {
+        let mut stdout = child.stdout.take().context("stdout missing")?;
+        fcntl(stdout.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut output = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            ensure!(std::time::Instant::now() < deadline, "deadline exceeded");
+            match stdout.read(&mut buffer) {
+                Ok(0) => {
+                    if let Some(status) = child.try_wait()? {
+                        ensure!(status.success(), "exited with {status}");
+                        return Ok(output);
+                    }
+                }
+                Ok(n) => {
+                    output.extend_from_slice(&buffer[..n]);
+                    ensure!(output.len() <= MAX_BYTES, "output exceeds size limit");
+                    continue;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(e) => return Err(e.into()),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    result
 }
 
 fn has_implicit_resume(argv: &[String]) -> bool {

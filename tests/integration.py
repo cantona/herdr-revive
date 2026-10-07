@@ -336,6 +336,138 @@ class Integration(unittest.TestCase):
         failed = f.run("save", ok=False)
         self.assertIn("unsupported launcher", failed.stderr)
 
+    def start_claude_attach(self, f, target, listing, bare=False, record=None,
+                            other_profile=False):
+        # A real executable named claude: /proc must show argv[0] as claude, which a
+        # script run through its interpreter would not. `agents --json` prints the
+        # listing and records any HERDR_* variable it inherited; anything else
+        # waits like an attached client.
+        source = f.root / "claude.c"
+        source.write_text(r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+extern char **environ;
+int main(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[1], "agents") && !strcmp(argv[2], "--json")
+            && !strcmp(argv[3], "--all")) {
+        FILE *leak = fopen(getenv("REVIVE_TEST_LEAK"), "w");
+        for (char **e = environ; *e; e++)
+            if (!strncmp(*e, "HERDR_", 6)) fprintf(leak, "%s\n", *e);
+        fclose(leak);
+        FILE *profile = fopen(getenv("REVIVE_TEST_PROFILE"), "w");
+        fputs(getenv("CLAUDE_CONFIG_DIR") ? getenv("CLAUDE_CONFIG_DIR") : "", profile);
+        fclose(profile);
+        fputs(getenv("REVIVE_TEST_AGENTS"), stdout);
+        return 0;
+    }
+    for (;;) pause();
+}
+''')
+        program = f.bin_dir / "claude"
+        subprocess.run(["cc", str(source), "-o", str(program)], check=True)
+        original_env = f.env
+        # other_profile: revive runs under another Claude profile than the pane,
+        # and the listing must still come from the pane's.
+        profile = dict(CLAUDE_CONFIG_DIR=str(f.root / "other-profile")) if other_profile else {}
+        f.env = lambda: dict(original_env(), REVIVE_TEST_AGENTS=json.dumps(listing),
+                             REVIVE_TEST_LEAK=str(f.root / "leak.txt"),
+                             REVIVE_TEST_PROFILE=str(f.root / "profile.txt"), **profile)
+        # bare: the pane finds claude on its own PATH, which revive's PATH lacks
+        launched = "claude" if bare else str(program)
+        os.write(f.master, (shlex.join([launched, "attach", target]) + "\n").encode())
+        deadline = time.monotonic() + 3
+        while os.tcgetpgrp(f.master) == f.pid and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        original = f.pane
+        extra = {} if record is None else dict(agent_session=dict(
+            source="herdr:claude", agent="claude", kind="id", value=record))
+        f.pane = lambda i=1: dict(original(i), agent="claude", agent_status="idle", **extra)
+        return launched
+
+    def write_transcript(self, f, session, cwd=None):
+        cwd = cwd or str(f.root.resolve())
+        project = "".join(c if c.isascii() and c.isalnum() else "-" for c in cwd)
+        path = f.root / "claude-config" / "projects" / project / f"{session}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}\n")
+
+    def test_claude_attach_short_id_is_saved_as_its_exact_session(self):
+        session = "4ebb551e-336c-4422-998e-19ae92df9dc3"
+        f = self.fixture()
+        self.write_transcript(f, session)
+        program = self.start_claude_attach(f, "4ebb551e", other_profile=True, listing=[
+            dict(id="abd9816e", sessionId="abd9816e-25d7-423f-9b5d-8d1241756c2f"),
+            dict(sessionId="cbbff058-4399-4af0-a6f8-875c8051417c", name="check-c2"),
+            dict(id="4ebb551e", sessionId=session, name="Pepos process utils library")])
+        saved = json.loads(Path(f.run("save")["result"]["path"]).read_text())["panes"][0]
+        self.assertEqual(saved["command"]["kind"], "agent")
+        self.assertEqual(saved["command"]["executable"], program)
+        self.assertEqual(saved["command"]["session_id"], session)
+        self.assertEqual((f.root / "leak.txt").read_text(), "")
+        self.assertEqual((f.root / "profile.txt").read_text(), str(f.root / "claude-config"))
+        self.assertNotIn("session_mode", saved["command"])
+
+    LISTING = [dict(id="4ebb551e", sessionId="4ebb551e-336c-4422-998e-19ae92df9dc3")]
+
+    def test_claude_attach_wins_over_a_stale_herdr_record(self):
+        # The daemon's hooks report to whichever pane started it, so herdr's
+        # record for an attach pane can name another pane's session.
+        f = self.fixture()
+        self.write_transcript(f, "4ebb551e-336c-4422-998e-19ae92df9dc3")
+        self.start_claude_attach(f, "4ebb551e", self.LISTING,
+                                 record="cbbff058-4399-4af0-a6f8-875c8051417c")
+        saved = json.loads(Path(f.run("save")["result"]["path"]).read_text())["panes"][0]
+        self.assertEqual(saved["command"]["session_id"], "4ebb551e-336c-4422-998e-19ae92df9dc3")
+
+    def test_unresolvable_claude_attach_falls_back_to_herdrs_record(self):
+        record = "cbbff058-4399-4af0-a6f8-875c8051417c"
+        f = self.fixture()
+        self.write_transcript(f, record)
+        self.start_claude_attach(f, "Pepos process", self.LISTING, record=record)
+        result = f.run("save")
+        saved = json.loads(Path(result["result"]["path"]).read_text())["panes"][0]
+        self.assertEqual(saved["command"]["session_id"], record)
+
+    def test_bare_claude_attach_is_found_on_the_panes_path(self):
+        f = self.fixture()
+        self.write_transcript(f, "4ebb551e-336c-4422-998e-19ae92df9dc3")
+        self.assertNotIn(str(f.bin_dir), os.environ.get("PATH", ""))
+        self.start_claude_attach(f, "4ebb551e", self.LISTING, bare=True)
+        saved = json.loads(Path(f.run("save")["result"]["path"]).read_text())["panes"][0]
+        self.assertEqual(saved["command"]["executable"], "claude")
+        self.assertEqual(saved["command"]["session_id"], "4ebb551e-336c-4422-998e-19ae92df9dc3")
+
+    def test_claude_attach_resumes_a_transcript_under_another_project(self):
+        # attach may be typed anywhere; the session's project need not be the pane's cwd
+        f = self.fixture()
+        self.write_transcript(f, "4ebb551e-336c-4422-998e-19ae92df9dc3",
+                              cwd="/build/buildlab/lab-home/b580x")
+        self.start_claude_attach(f, "4ebb551e", self.LISTING)
+        saved = json.loads(Path(f.run("save")["result"]["path"]).read_text())["panes"][0]
+        self.assertNotIn("session_mode", saved["command"])
+
+    def test_claude_attach_to_a_session_without_a_transcript_is_created(self):
+        f = self.fixture()
+        self.start_claude_attach(f, "4ebb551e", self.LISTING)
+        saved = json.loads(Path(f.run("save")["result"]["path"]).read_text())["panes"][0]
+        self.assertEqual(saved["command"]["session_id"], "4ebb551e-336c-4422-998e-19ae92df9dc3")
+        self.assertEqual(saved["command"]["session_mode"], "create")
+
+    def test_claude_attach_that_names_no_single_session_fails_the_save(self):
+        listing = self.LISTING
+        for target, error in (("Pepos process", "by name"), ("deadbeef", "lists 0 sessions")):
+            with self.subTest(target=target):
+                f = self.fixture()
+                path = f.seed()
+                before = path.read_bytes()
+                self.start_claude_attach(f, target, listing)
+                failed = f.run("save", ok=False)
+                self.assertIn(error, failed.stderr)
+                self.assertEqual(path.read_bytes(), before)
+
     def test_any_host_version_with_unknown_fields_saves_and_restores(self):
         for transport, protocol in (("direct", 99), ("cli", None)):
             with self.subTest(transport=transport):
