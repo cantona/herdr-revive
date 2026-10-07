@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.5 — 2026-10-07 (prerelease)
+
+- Save panes of agents Revive cannot resume as ordinary programs instead of
+  failing the save. A pane reporting an agent such as `annotator` (the
+  herdr-file-annotator review pane), opencode or pi no longer blocks autosave;
+  restore runs it only if allowlisted, freshly. Claude, Codex, Gemini, Copilot
+  and Cursor behind an unrecognized launcher still fail capture.
+- Keep status events of non-resumable agents debounced, so they no longer write
+  a snapshot per status change and rotate retained snapshots out.
+
 ## 0.1.4 — 2026-10-07 (prerelease)
 
 - Accept every Herdr release from `min_herdr_version` (0.9.1) onward. The

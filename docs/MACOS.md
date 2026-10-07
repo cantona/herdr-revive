@@ -1,7 +1,7 @@
 # macOS support and validation
 
-Version `v0.1.4` supports Linux and macOS. Install with
-`herdr plugin install cantona/herdr-revive --ref v0.1.4`, or build and link a
+Version `v0.1.5` supports Linux and macOS. Install with
+`herdr plugin install cantona/herdr-revive --ref v0.1.5`, or build and link a
 local checkout using the README's development instructions.
 Xcode Command Line Tools, Rust 1.97.1+, and Herdr 0.9.1 or newer are required.
 
