@@ -594,6 +594,16 @@ fn deterministic_planning_for_fixture_sizes() {
 }
 
 #[test]
+fn live_snapshot_from_any_host_version_is_accepted() {
+    let l: LiveSnapshot = serde_json::from_value(json!({"version":"1.4.0", "protocol":99,
+        "future_field":{"x":1},
+        "workspaces":[{"workspace_id":"w1"}], "tabs":[{"workspace_id":"w1","tab_id":"w1:t1"}],
+        "panes":[{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","terminal_id":"term_fixture","cwd":"/tmp"}]}))
+    .unwrap();
+    assert!(planner::index_live(&l).is_ok());
+}
+
+#[test]
 fn duplicate_live_ids_and_orphans_are_errors() {
     let mut l = live();
     l.panes.push(l.panes[0].clone());
@@ -623,8 +633,6 @@ fn response_envelopes_are_checked_and_redacted() {
         transport::decode_response(br#"{"id":"right","result":{"type":"pong"}}"#, "right", "ok")
             .is_err()
     );
-    assert!(validate_protocol("0.9.1", 23).is_err());
-    assert!(validate_protocol("9.0.0", 22).is_err());
 }
 
 #[test]

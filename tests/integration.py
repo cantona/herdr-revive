@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolated Linux/macOS PTY/API tests. No real Herdr session is used."""
 import concurrent.futures
+import functools
 import json
 import os
 from pathlib import Path
@@ -21,8 +22,29 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get("REVIVE_BINARY", ROOT / "target/debug/herdr-revive"))
 
 
+@functools.cache
+def cli_protocol():
+    """The binary protocol of the installed herdr CLI, which refuses a server on
+    any other protocol before revive sees the reply. Probed only by cli-transport
+    tests, so a missing or broken herdr fails those and leaves direct ones running."""
+    out = subprocess.run([shutil.which("herdr") or "herdr", "api", "schema"],
+                         capture_output=True, text=True, timeout=10, check=True).stdout
+    for line in out.splitlines():
+        if line.startswith("protocol:"):
+            return int(line.split(":", 1)[1])
+    raise AssertionError(f"herdr api schema printed no protocol line: {out!r}")
+
+
 class Fixture:
-    def __init__(self, transport="direct", panes=1, shell="bash", default_claude=False):
+    # The default host is a release revive was never validated on, so a host
+    # version pin fails every test on every machine, not only off 0.9.1.
+    def __init__(self, transport="direct", panes=1, shell="bash", default_claude=False,
+                 host_version="0.9.99", host_protocol=None, host_extras=False):
+        self.host_version = host_version
+        if host_protocol is None:
+            host_protocol = cli_protocol() if transport == "cli" else 22
+        self.host_protocol = host_protocol
+        self.host_extras = host_extras
         # Darwin's default TMPDIR can exceed the Unix socket path limit.
         self.temp = tempfile.TemporaryDirectory(prefix="herdr-revive-test-", dir="/tmp")
         self.root = Path(self.temp.name)
@@ -95,21 +117,27 @@ class Fixture:
                     return bytes(output)
         raise AssertionError(f"PTY did not produce {needle!r}: {output!r}")
 
+    def extras(self):
+        return dict(future_field=dict(nested=[1])) if self.host_extras else {}
+
     def pane(self, i=1):
         return dict(workspace_id="w1", tab_id="w1:t1", pane_id=f"w1:p{i}",
                     terminal_id=f"term_fixture_{i}", cwd=str(self.root),
-                    agent=None, agent_status="unknown")
+                    agent=None, agent_status="unknown", **self.extras())
 
     def result(self, request):
         method = request["method"]
         self.requests.append(method)
         if method == "ping":
-            return dict(type="pong", version="0.9.1", protocol=22)
+            return dict(type="pong", version=self.host_version, protocol=self.host_protocol,
+                        **self.extras())
         if method == "session.snapshot":
-            return dict(type="session_snapshot", snapshot=dict(version="0.9.1", protocol=22,
+            return dict(type="session_snapshot", snapshot=dict(
+                        version=self.host_version, protocol=self.host_protocol,
                         workspaces=[dict(workspace_id="w1")],
                         tabs=[dict(workspace_id="w1", tab_id="w1:t1")],
-                        panes=[self.pane(i) for i in range(1, self.panes + 1)]))
+                        panes=[self.pane(i) for i in range(1, self.panes + 1)],
+                        **self.extras()))
         if method == "pane.get":
             return dict(type="pane_info", pane=self.pane())
         if method == "layout.export":
@@ -252,6 +280,19 @@ class Integration(unittest.TestCase):
         self.assertEqual(saved["command"], dict(kind="program", argv=args))
         self.assertEqual(Path(saved["cwd"]), f.root.resolve())
         self.assertFalse((f.root / "WRONG").exists())
+
+    def test_any_host_version_with_unknown_fields_saves_and_restores(self):
+        for transport, protocol in (("direct", 99), ("cli", None)):
+            with self.subTest(transport=transport):
+                f = self.fixture(transport=transport, host_version="1.0.0",
+                                 host_protocol=protocol, host_extras=True)
+                f.seed(["ssh", "fixture.invalid"])
+                self.assertEqual(f.run("preview")["result"]["plan"]["entries"][0]["decision"],
+                                 "candidate")
+                f.run("restore", "--rehydrate")
+                self.assertEqual(f.wait_argv()[1:], ["fixture.invalid"])
+                if transport == "direct":
+                    self.assertIn("ping", f.requests)
 
     def test_literal_ssh_and_minicom_through_both_transports(self):
         for transport in ("direct", "cli"):

@@ -25,7 +25,6 @@ pub enum Decision {
 }
 
 pub fn index_live(live: &LiveSnapshot) -> Result<BTreeMap<&str, &LivePane>> {
-    validate_protocol(&live.version, live.protocol)?;
     let workspaces: HashSet<_> = live.workspaces.iter().map(|w| &w.workspace_id).collect();
     ensure!(
         workspaces.len() == live.workspaces.len(),

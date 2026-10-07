@@ -7,8 +7,7 @@ remains planned.
 
 ## Build and installation
 
-Requires Rust/Cargo 1.97.1+, a C linker, Git, and Herdr 0.9.1 / protocol 22.
-The runtime currently refuses other host version/protocol pairs.
+Requires Rust/Cargo 1.97.1+, a C linker, Git, and Herdr 0.9.1 or newer.
 
 ```sh
 herdr plugin install cantona/herdr-revive --ref v0.1.3

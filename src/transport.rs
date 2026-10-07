@@ -90,16 +90,10 @@ impl Transport {
             return Ok(());
         }
         if self.kind == TransportKind::Direct {
-            let pong = self.request("ping", json!({}), &[], "", "pong")?;
-            let version = pong["version"].as_str().context("missing host version")?;
-            let protocol: u32 = pong["protocol"]
-                .as_u64()
-                .context("missing host protocol")?
-                .try_into()?;
-            validate_protocol(version, protocol)?;
+            self.request("ping", json!({}), &[], "", "pong")?;
             self.checked = true;
         } else {
-            // The CLI has no raw ping command; snapshot is its versioned handshake.
+            // The CLI has no raw ping command; snapshot is its handshake.
             self.snapshot()?;
         }
         Ok(())
@@ -128,7 +122,6 @@ impl Host for Transport {
             "session_snapshot",
         )?;
         let snapshot: LiveSnapshot = field(value, "snapshot")?;
-        validate_protocol(&snapshot.version, snapshot.protocol)?;
         self.checked = true;
         Ok(snapshot)
     }

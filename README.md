@@ -98,7 +98,12 @@ and [validation](docs/VALIDATION.md) before enabling automatic restoration.
 ## Installation
 
 Requires Linux with readable `/proc` or macOS, Rust/Cargo **1.97.1+**, a C linker, and
-Herdr **0.9.1 / protocol 22**. The runtime currently accepts only that host pair.
+Herdr **0.9.1 or newer**, declared as `min_herdr_version` and enforced by Herdr at
+install and link time. A host method revive calls that a newer Herdr no longer
+offers fails the operation with an error (Herdr's details are redacted). A
+running agent whose session can be identified neither from Herdr's metadata nor
+from a resume ID on its command line fails the save and keeps the previous
+snapshot.
 No Node or Python runtime is required. The popup uses POSIX `sh`, with optional
 `fzf` for saved-space selection. Python 3 is used only by development scripts.
 On macOS, install Xcode Command Line Tools (`xcode-select --install`) for the linker.

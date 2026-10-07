@@ -190,10 +190,11 @@ one of those triggers. Mutation delivery is never retried by this mechanism.
 ## Transport
 
 The direct adapter makes one connection per newline-delimited JSON request.
-It validates ping version/protocol once per operation, response IDs, result
-types, error envelopes, frame size, and a total deadline covering both write
-and read. It never retries mutations. Unix sockets are nonblocking, including
-connection establishment; unavailable or saturated endpoints fail closed.
+It sends one ping per operation as a reachability check, and validates
+response IDs, result types, error envelopes, frame size, and a total deadline
+covering both write and read. It never retries mutations. Unix sockets are
+nonblocking, including connection establishment; unavailable or saturated
+endpoints fail closed.
 
 CLI mode uses exactly the injected `HERDR_BIN_PATH` with argv and an explicit
 socket environment. Stdout is bounded/nonblocking, errors are redacted, and a

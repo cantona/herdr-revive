@@ -7,7 +7,6 @@ pub const TOOL: &str = "herdr-revive";
 pub const PLUGIN_ID: &str = "cantona.herdr-revive";
 pub const SCHEMA: u32 = 1;
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
-pub const PROTOCOL: u32 = 22;
 
 pub fn native_tool(tool: &str) -> bool {
     matches!(tool, TOOL | "herde-revive")
@@ -795,8 +794,6 @@ impl Snapshot {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LiveSnapshot {
     pub focused_pane_id: Option<String>,
-    pub version: String,
-    pub protocol: u32,
     pub workspaces: Vec<Workspace>,
     pub tabs: Vec<Tab>,
     pub panes: Vec<LivePane>,
@@ -844,12 +841,4 @@ pub struct ProcessInfo {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ForegroundProcess {
     pub pid: u32,
-}
-
-pub fn validate_protocol(version: &str, protocol: u32) -> Result<()> {
-    ensure!(
-        version == "0.9.1" && protocol == PROTOCOL,
-        "unsupported Herdr version/protocol (validated: 0.9.1/22)"
-    );
-    Ok(())
 }
