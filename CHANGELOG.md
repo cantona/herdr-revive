@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.6 — 2026-10-15 (prerelease)
+
+- Save Claude Code panes that reopened a background session as
+  `claude attach <short id>`. Capture now looks the id up in
+  `claude agents --json --all`, using the pane's `CLAUDE_CONFIG_DIR`, `HOME`
+  and `PATH`, and saves the pane as `--resume <uuid>`; before, the save failed
+  and the last snapshot went stale. The resolved session takes precedence over
+  Herdr's record, which can name another pane's session because the daemon's
+  hooks report to the pane that started it. An attach that cannot be resolved
+  falls back to Herdr's record when there is one.
+
 ## 0.1.5 — 2026-10-07 (prerelease)
 
 - Save panes of agents Revive cannot resume as ordinary programs instead of
