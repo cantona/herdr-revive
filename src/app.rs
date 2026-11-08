@@ -1,8 +1,9 @@
+use crate::core::host::{CoreHost, RunMode};
 use crate::model::*;
 use crate::store::Store;
 use crate::transport::{Host, Transport};
 use crate::{capture, planner, platform, store};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,8 +20,17 @@ pub struct Cli {
     pub socket: Option<PathBuf>,
     #[arg(long, global = true)]
     pub herdr_bin: Option<PathBuf>,
+    #[arg(long, global = true, value_enum)]
+    pub host: Option<HostKind>,
     #[command(subcommand)]
     pub command: Action,
+}
+
+impl Cli {
+    /// Whether the caller named the paths a host needs.
+    pub fn explicit_paths(&self) -> bool {
+        self.config_dir.is_some() || self.state_dir.is_some() || self.socket.is_some()
+    }
 }
 
 #[derive(Subcommand, Clone)]
@@ -69,6 +79,20 @@ pub enum Action {
     },
     /// Print the default TOML configuration.
     Config,
+    /// Print the shell hook for the herdr-core host; the rc file evaluates it.
+    Init {
+        #[arg(value_enum)]
+        shell: InitShell,
+    },
+    /// Show, add or remove the rc line that loads the hook (herdr-core host).
+    Install {
+        #[arg(long, conflicts_with = "remove")]
+        write: bool,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// One read-only JSON document: latest snapshot, relaunch plan, recovery, setup.
+    Status,
 }
 
 #[derive(Subcommand, Clone)]
@@ -111,6 +135,460 @@ pub enum RecoveryAction {
     Acknowledge {
         generation: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostKind {
+    Herdr,
+    Core,
+}
+
+impl HostKind {
+    /// `herdr` is implied when Herdr itself runs the plugin, and when the
+    /// caller names its paths (`--config-dir`, `--state-dir`, `--socket`), as
+    /// every invocation outside a plugin had to before the core host existed.
+    pub fn resolve(explicit: Option<Self>, explicit_paths: bool) -> Result<Self> {
+        if let Some(kind) = explicit {
+            return Ok(kind);
+        }
+        match std::env::var("HERDR_REVIVE_HOST") {
+            Ok(value) => match value.as_str() {
+                "herdr" => Ok(Self::Herdr),
+                "core" => Ok(Self::Core),
+                _ => bail!("HERDR_REVIVE_HOST must be herdr or core"),
+            },
+            Err(std::env::VarError::NotPresent) => {
+                ensure!(
+                    explicit_paths || std::env::var_os("HERDR_PLUGIN_STATE_DIR").is_some(),
+                    "--host herdr|core is required outside a Herdr plugin environment"
+                );
+                Ok(Self::Herdr)
+            }
+            Err(_) => bail!("HERDR_REVIVE_HOST must be herdr or core"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum InitShell {
+    Bash,
+}
+
+pub enum HostImpl {
+    Herdr(Transport),
+    Core(CoreHost),
+}
+
+impl HostImpl {
+    pub fn requests(&self) -> usize {
+        match self {
+            Self::Herdr(host) => host.requests,
+            Self::Core(host) => host.requests(),
+        }
+    }
+    pub fn children(&self) -> usize {
+        match self {
+            Self::Herdr(host) => host.children,
+            Self::Core(_) => 0,
+        }
+    }
+    pub fn emitted(&mut self) -> Vec<String> {
+        match self {
+            Self::Herdr(_) => Vec::new(),
+            Self::Core(host) => std::mem::take(&mut host.emitted),
+        }
+    }
+}
+
+impl Host for HostImpl {
+    fn supports_layout(&self) -> bool {
+        match self {
+            Self::Herdr(host) => host.supports_layout(),
+            Self::Core(host) => host.supports_layout(),
+        }
+    }
+    fn snapshot(&mut self) -> Result<LiveSnapshot> {
+        match self {
+            Self::Herdr(host) => host.snapshot(),
+            Self::Core(host) => host.snapshot(),
+        }
+    }
+    fn process_info(&mut self, pane: &str) -> Result<ProcessInfo> {
+        match self {
+            Self::Herdr(host) => host.process_info(pane),
+            Self::Core(host) => host.process_info(pane),
+        }
+    }
+    fn pane(&mut self, pane: &str) -> Result<LivePane> {
+        match self {
+            Self::Herdr(host) => host.pane(pane),
+            Self::Core(host) => host.pane(pane),
+        }
+    }
+    fn run(&mut self, pane: &str, text: &str) -> Result<()> {
+        match self {
+            Self::Herdr(host) => host.run(pane, text),
+            Self::Core(host) => host.run(pane, text),
+        }
+    }
+    fn api(&mut self, method: &str, params: Value, result_type: &str) -> Result<Value> {
+        match self {
+            Self::Herdr(host) => host.api(method, params, result_type),
+            Self::Core(host) => host.api(method, params, result_type),
+        }
+    }
+}
+
+pub fn config_dir_for(kind: HostKind, explicit: Option<PathBuf>) -> Result<PathBuf> {
+    match kind {
+        HostKind::Herdr => env_path(explicit, "HERDR_PLUGIN_CONFIG_DIR"),
+        HostKind::Core => crate::core::paths::config_dir(explicit),
+    }
+}
+
+pub fn state_dir_for(kind: HostKind, explicit: Option<PathBuf>) -> Result<PathBuf> {
+    match kind {
+        HostKind::Herdr => env_path(explicit, "HERDR_PLUGIN_STATE_DIR"),
+        HostKind::Core => crate::core::paths::state_dir(explicit),
+    }
+}
+
+pub fn socket_for(kind: HostKind, explicit: Option<PathBuf>) -> Result<(PathBuf, String)> {
+    match kind {
+        HostKind::Herdr => store::session_identity(&env_path(explicit, "HERDR_SOCKET_PATH")?),
+        HostKind::Core => {
+            let socket = match explicit {
+                Some(socket) => socket,
+                None => crate::core::paths::resolve_socket(
+                    &crate::core::paths::SocketInputs::from_env()?,
+                ),
+            };
+            crate::core::paths::session_identity(&socket)
+        }
+    }
+}
+
+/// Hooks wait a bounded time for the session lock instead of skipping: an
+/// `init` that skipped would silently lose this pane's relaunch.
+pub fn wait_lock(store: &Store, config: &Config) -> Result<store::Lock> {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis((config.timeout_ms + config.settle_ms).min(60_000));
+    let mut pause_ms = 5;
+    loop {
+        if let Some(lock) = store.try_lock()? {
+            return Ok(lock);
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "another operation holds the session lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        pause_ms = (pause_ms * 2).min(50);
+    }
+}
+
+/// `init` is evaluated by an interactive shell as it starts, so it exits 0.
+/// A failure before the hook exists prints nothing; a later failure still
+/// prints the hook, which parses and so cannot break the shell. A nested
+/// shell, whose parent is not the pane's shell, gets nothing.
+/// `REVIVE_DEBUG=1` shows the reason.
+fn init(cli: &Cli, shell: InitShell) -> Value {
+    match init_inner(cli, shell) {
+        Ok(text) => json!({"text": text}),
+        Err(error) => {
+            init_debug(&error);
+            json!({"text": ""})
+        }
+    }
+}
+
+/// Whether `pid` is herdr-core's holder (`herdr-core hold ...`), the process
+/// that starts every pane's shell.
+fn parent_is_core_holder(pid: u32) -> bool {
+    crate::platform::process(pid)
+        .and_then(|process| crate::platform::argv_and_cwd(&process))
+        .is_ok_and(|(argv, _)| {
+            argv.first()
+                .and_then(|arg| std::path::Path::new(arg).file_name())
+                .is_some_and(|name| name == "herdr-core")
+                && argv.get(1).is_some_and(|arg| arg == "hold")
+        })
+}
+
+fn init_debug(error: &anyhow::Error) {
+    if std::env::var("REVIVE_DEBUG").as_deref() == Ok("1") {
+        eprintln!("herdr-revive: init: {error:#}");
+    }
+}
+
+fn init_inner(cli: &Cli, shell: InitShell) -> Result<String> {
+    let kind = HostKind::resolve(cli.host, cli.explicit_paths())?;
+    ensure!(
+        kind == HostKind::Core,
+        "init is only for the herdr-core host"
+    );
+    let InitShell::Bash = shell;
+    let terminal = std::env::var("HC_TERMINAL_ID").context("HC_TERMINAL_ID is not set")?;
+    validate_id(&terminal)?;
+    let config_dir = config_dir_for(kind, cli.config_dir.clone())?;
+    let config = store::load_config(&config_dir)?;
+    if !config.auto_save && !config.auto_restore {
+        return Ok(String::new());
+    }
+    let binary = std::env::current_exe().context("own executable path unavailable")?;
+    let binary = binary.to_str().context("non-UTF-8 executable path")?;
+    let hook = if config.auto_save {
+        crate::core::hook::bash_snippet(&config, binary)
+    } else {
+        String::new()
+    };
+    let (socket, session) = socket_for(kind, cli.socket.clone())?;
+    let parent = u32::try_from(nix::unistd::getppid().as_raw())?;
+    let (core, record) = match CoreHost::connect(&socket, &config, RunMode::Emit)
+        .and_then(|mut core| core.terminal(&terminal).map(|record| (core, record)))
+    {
+        Ok(found) => found,
+        Err(error) => {
+            init_debug(&error);
+            // Without core the parent check below cannot run. `init` runs in
+            // the shell's own command substitution, so `parent` is that shell;
+            // only a shell the core's holder started is a pane's shell. A
+            // nested one would install a hook whose saves are all dropped.
+            let grandparent = crate::platform::process(parent).map(|shell| shell.parent);
+            return Ok(if grandparent.is_ok_and(parent_is_core_holder) {
+                hook
+            } else {
+                String::new()
+            });
+        }
+    };
+    ensure!(
+        record["pid"].as_u64() == Some(u64::from(parent)),
+        "init was not started by the pane's shell"
+    );
+    if !config.auto_restore {
+        return Ok(hook);
+    }
+    let paths = InitPaths {
+        state_dir: state_dir_for(kind, cli.state_dir.clone())?,
+        session,
+        socket,
+        config_dir,
+    };
+    match init_relaunch(core, &record, &paths, &config, parent) {
+        Ok(Relaunch::Command(text)) => Ok(text + &hook),
+        Ok(Relaunch::Notice(text)) => Ok(hook + text),
+        Ok(Relaunch::Nothing) => Ok(hook),
+        Err(error) => {
+            init_debug(&error);
+            Ok(hook)
+        }
+    }
+}
+
+/// What `init` adds to the hook. The relaunch goes before it: both put an
+/// entry first in `PROMPT_COMMAND`, and the hook's `__revive_rc=$?` has to
+/// end up ahead of `__revive_relaunch`.
+enum Relaunch {
+    Nothing,
+    Command(String),
+    Notice(&'static str),
+}
+
+struct InitPaths {
+    state_dir: PathBuf,
+    session: String,
+    socket: PathBuf,
+    config_dir: PathBuf,
+}
+
+const AUTO_OFF_NOTICE: &str =
+    "printf '\\033[2mherdr-revive: automatic relaunch skipped (REVIVE_AUTO=0)\\033[0m\\n' >&2\n";
+
+const LOCK_NOTICE: &str = "printf '\\033[2mherdr-revive: automatic relaunch skipped: another operation held the session lock (herdr-revive --host core restore --rehydrate)\\033[0m\\n' >&2\n";
+
+const RECOVERY_NOTICE: &str = "printf '\\033[2mherdr-revive: automatic relaunch skipped: recovery evidence is pending (herdr-revive --host core recovery inspect, then herdr-revive --host core recovery acknowledge ID)\\033[0m\\n' >&2\n";
+
+fn init_relaunch(
+    core: CoreHost,
+    record: &Value,
+    paths: &InitPaths,
+    config: &Config,
+    parent: u32,
+) -> Result<Relaunch> {
+    let Some(pane) = crate::core::host::live_pane(record)? else {
+        return Ok(Relaunch::Nothing);
+    };
+    let store = Store::new(&paths.state_dir, paths.session.clone())?;
+    let live = crate::core::host::live_snapshot(std::slice::from_ref(record))?;
+    // Most new shells have nothing to relaunch; learn that before waiting
+    // for the lock, which a running save holds for seconds while the prompt
+    // waits. The snapshot is replaced atomically, so an unlocked read sees
+    // a whole one, and the plan is made again under the lock.
+    if matches!(
+        plan_pane(&store, &paths.socket, config, &live, &pane),
+        Ok(None)
+    ) {
+        return Ok(Relaunch::Nothing);
+    }
+    let lock = match wait_lock(&store, config) {
+        Ok(lock) => lock,
+        Err(error) => {
+            init_debug(&error);
+            return Ok(Relaunch::Notice(LOCK_NOTICE));
+        }
+    };
+    if let Err(error) = require_clear(&store) {
+        init_debug(&error);
+        return Ok(Relaunch::Notice(RECOVERY_NOTICE));
+    }
+    let Some(planned) = plan_pane(&store, &paths.socket, config, &live, &pane)? else {
+        return Ok(Relaunch::Nothing);
+    };
+    if std::env::var("REVIVE_AUTO").as_deref() == Ok("0") {
+        return Ok(if planned.entry.decision == planner::Decision::Candidate {
+            Relaunch::Notice(AUTO_OFF_NOTICE)
+        } else {
+            Relaunch::Nothing
+        });
+    }
+    let mut host = HostImpl::Core(core);
+    relaunch_pane(
+        &mut host,
+        &store,
+        &lock,
+        &paths.socket,
+        &paths.config_dir,
+        &planned,
+        parent,
+    )?;
+    let emitted = host.emitted();
+    if emitted.is_empty() {
+        return Ok(Relaunch::Nothing);
+    }
+    Ok(Relaunch::Command(crate::core::hook::bash_relaunch(
+        &emitted.join("\n"),
+    )))
+}
+
+struct PlannedPane {
+    generation: String,
+    saved: Snapshot,
+    entry: planner::PlanEntry,
+}
+
+/// The saved plan entry for one live pane, or `None` when there is nothing to
+/// do: no snapshot, no entry for the pane, or this boot already handled it.
+fn plan_pane(
+    store: &Store,
+    socket: &Path,
+    config: &Config,
+    live: &LiveSnapshot,
+    pane: &LivePane,
+) -> Result<Option<PlannedPane>> {
+    require_clear(store)?;
+    let generation = platform::generation(socket)?;
+    let path = store.snapshot_path(None)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let saved = store.read_snapshot(&path)?;
+    let plan = planner::plan(&saved, &store.session, live, config)?;
+    let Some(entry) = plan.entries.into_iter().find(|e| e.pane_id == pane.pane_id) else {
+        return Ok(None);
+    };
+    if boot(store, &generation)?
+        .is_some_and(|j| j.entries.iter().any(|e| e.pane_id == pane.pane_id))
+    {
+        return Ok(None);
+    }
+    Ok(Some(PlannedPane {
+        generation,
+        saved,
+        entry,
+    }))
+}
+
+fn relaunch_pane(
+    host: &mut HostImpl,
+    store: &Store,
+    lock: &store::Lock,
+    socket: &Path,
+    config_dir: &Path,
+    planned: &PlannedPane,
+    parent: u32,
+) -> Result<Option<Outcome>> {
+    let PlannedPane {
+        generation,
+        saved,
+        entry,
+    } = planned;
+    let saved_pane = saved
+        .panes
+        .iter()
+        .find(|p| p.pane_id == entry.pane_id)
+        .context("plan references unknown pane")?;
+    execute_pane(
+        host,
+        store,
+        lock,
+        saved,
+        saved_pane,
+        entry,
+        generation,
+        |_, saved, entry, host| {
+            ensure!(
+                &platform::generation(socket)? == generation,
+                "server changed during relaunch"
+            );
+            let current = store::load_config(config_dir)?;
+            ensure!(
+                current.auto_restore,
+                "automatic restore disabled during execution"
+            );
+            let argv = saved
+                .command
+                .as_ref()
+                .context("missing command")?
+                .allowed_argv(&current)?;
+            let live = match host.pane(&saved.pane_id) {
+                Ok(live) => live,
+                Err(error) => {
+                    init_debug(&error.context("relaunch skipped: terminal.get failed"));
+                    return Ok(None);
+                }
+            };
+            ensure!(
+                live.workspace_id == saved.workspace_id
+                    && live.tab_id == saved.tab_id
+                    && Some(&live.terminal_id) == entry.terminal_id.as_ref(),
+                "pane identity changed during relaunch"
+            );
+            let info = match host.process_info(&saved.pane_id) {
+                Ok(info) => info,
+                Err(error) => {
+                    init_debug(&error.context("relaunch skipped: process_info failed"));
+                    return Ok(None);
+                }
+            };
+            let Some(shell) = platform::startup_shell(&info, parent)? else {
+                init_debug(&anyhow!(
+                    "relaunch skipped: {}",
+                    if info.shell_pid == Some(parent) {
+                        "the shell does not hold its terminal's foreground group"
+                    } else {
+                        "the pane's shell is not the shell running init"
+                    }
+                ));
+                return Ok(None);
+            };
+            ensure!(shell == "bash", "init bash was evaluated by another shell");
+            Ok(Some(platform::shell_command(&shell, &saved.cwd, &argv)?))
+        },
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -297,37 +775,160 @@ pub fn execute(
             .iter()
             .find(|p| p.pane_id == journal.entries[i].pane_id)
             .context("plan references unknown pane")?;
-        // Persist Sending before any operation that might write to a pane.
-        journal.entries[i].outcome = Outcome::Sending;
+        send_entry(
+            host,
+            store,
+            &mut journal,
+            i,
+            pane,
+            &plan.entries[i],
+            &mut revalidate,
+            "restore stopped; inspect recovery evidence before any further save/restore",
+        )?;
         persist_pending(store, &journal)?;
-        let result: Result<Outcome> = (|| {
-            let Some(text) = revalidate(&mut journal.entries[i], pane, &plan.entries[i], host)?
-            else {
-                return Ok(Outcome::Skipped);
-            };
-            host.run(&pane.pane_id, &text)?;
-            Ok(Outcome::Applied)
-        })();
-        match result {
-            Ok(outcome) => {
-                journal.entries[i].outcome = outcome;
-                persist_pending(store, &journal)?;
-            }
-            Err(error) => {
-                journal.entries[i].outcome = Outcome::Failed;
-                journal.state = BootState::Failed;
-                persist_pending(store, &journal)
-                    .context("failed to persist failure; Sending evidence remains")?;
-                return Err(error).context(
-                    "restore stopped; inspect recovery evidence before any further save/restore",
-                );
-            }
-        }
     }
     journal.state = BootState::Done;
     finish(store, &journal)?;
     Ok(journal)
 }
+
+/// Sends journal entry `i` and records its outcome in memory; the caller
+/// persists a success. A failure is persisted here as `Failed` evidence.
+#[allow(clippy::too_many_arguments)]
+fn send_entry(
+    host: &mut impl Host,
+    store: &Store,
+    journal: &mut Journal,
+    i: usize,
+    pane: &SavedPane,
+    entry: &planner::PlanEntry,
+    revalidate: &mut impl FnMut(
+        &mut JournalEntry,
+        &SavedPane,
+        &planner::PlanEntry,
+        &mut dyn Host,
+    ) -> Result<Option<String>>,
+    stopped: &'static str,
+) -> Result<Outcome> {
+    // Persist Sending before any operation that might write to a pane.
+    journal.entries[i].outcome = Outcome::Sending;
+    persist_pending(store, journal)?;
+    let result: Result<Outcome> = (|| {
+        let Some(text) = revalidate(&mut journal.entries[i], pane, entry, host)? else {
+            return Ok(Outcome::Skipped);
+        };
+        host.run(&pane.pane_id, &text)?;
+        Ok(Outcome::Applied)
+    })();
+    match result {
+        Ok(outcome) => {
+            journal.entries[i].outcome = outcome.clone();
+            Ok(outcome)
+        }
+        Err(error) => {
+            journal.entries[i].outcome = Outcome::Failed;
+            journal.state = BootState::Failed;
+            persist_pending(store, journal)
+                .context("failed to persist failure; Sending evidence remains")?;
+            Err(error).context(stopped)
+        }
+    }
+}
+
+/// One pane's relaunch at its shell's start. A generation's boot record grows
+/// one entry per pane; a pane already recorded in this generation is left
+/// alone (`None`). Non-candidates are recorded as skipped without running.
+/// In a per-pane boot record `acknowledged` describes only the latest
+/// unresolved send; `pending.json` existing is what means unresolved.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pane(
+    host: &mut impl Host,
+    store: &Store,
+    _lock: &store::Lock,
+    saved: &Snapshot,
+    pane: &SavedPane,
+    entry: &planner::PlanEntry,
+    generation: &str,
+    mut revalidate: impl FnMut(
+        &mut JournalEntry,
+        &SavedPane,
+        &planner::PlanEntry,
+        &mut dyn Host,
+    ) -> Result<Option<String>>,
+) -> Result<Option<Outcome>> {
+    require_clear(store)?;
+    ensure!(
+        entry.pane_id == pane.pane_id,
+        "plan entry does not match pane"
+    );
+    let mut journal = match boot(store, generation)? {
+        Some(record) => record,
+        None => {
+            let mut record = Journal::new(&store.session, generation);
+            record.snapshot_hash = Some(store::digest(&serde_json::to_vec(saved)?));
+            record
+        }
+    };
+    if journal.entries.iter().any(|e| e.pane_id == pane.pane_id) {
+        return Ok(None);
+    }
+    journal.acknowledged = false;
+    if entry.decision != planner::Decision::Candidate {
+        journal.entries.push(JournalEntry {
+            pane_id: pane.pane_id.clone(),
+            outcome: Outcome::Skipped,
+        });
+        journal.state = BootState::Done;
+        finish(store, &journal)?;
+        return Ok(Some(Outcome::Skipped));
+    }
+    journal.state = BootState::Restoring;
+    journal.entries.push(JournalEntry {
+        pane_id: pane.pane_id.clone(),
+        outcome: Outcome::Pending,
+    });
+    let i = journal.entries.len() - 1;
+    let outcome = send_entry(
+        host,
+        store,
+        &mut journal,
+        i,
+        pane,
+        entry,
+        &mut revalidate,
+        "relaunch stopped; inspect recovery evidence before any further save/restore",
+    )?;
+    journal.state = BootState::Done;
+    finish(store, &journal)?;
+    Ok(Some(outcome))
+}
+
+/// A hook save runs detached and can land after herdr-core restarted, when
+/// the terminal it names belongs to a new shell; saving then would overwrite
+/// the snapshot without the command the old shell was running. Without the
+/// hook's `REVIVE_SHELL_PID` (a manual save) there is nothing to compare.
+fn hook_shell_is_current(core: &mut CoreHost) -> Result<bool> {
+    let (Ok(shell), Ok(terminal)) = (
+        std::env::var("REVIVE_SHELL_PID"),
+        std::env::var("HC_TERMINAL_ID"),
+    ) else {
+        return Ok(true);
+    };
+    let shell: u64 = shell
+        .parse()
+        .context("REVIVE_SHELL_PID is not a process ID")?;
+    let record = match core.terminal(&terminal) {
+        Ok(record) => record,
+        Err(error) if error.downcast_ref::<crate::core::rpc::RpcError>().is_some() => {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(record["state"].as_str() == Some("live") && record["pid"].as_u64() == Some(shell))
+}
+
+const CORE_UNSUPPORTED: &str =
+    "named spaces and layout rebuild are not supported by the herdr-core host";
 
 pub fn run(cli: Cli) -> Result<Value> {
     if matches!(cli.command, Action::Timer { .. }) {
@@ -336,10 +937,29 @@ pub fn run(cli: Cli) -> Result<Value> {
     if matches!(cli.command, Action::Config) {
         return Ok(json!({"config": toml::to_string_pretty(&Config::default())?}));
     }
+    if let Action::Init { shell } = cli.command {
+        return Ok(init(&cli, shell));
+    }
+    let kind = HostKind::resolve(cli.host, cli.explicit_paths())?;
+    if let Action::Install { write, remove } = cli.command {
+        ensure!(
+            kind == HostKind::Core,
+            "install is only for the herdr-core host"
+        );
+        return crate::core::install::run(&crate::core::paths::home_dir()?, write, remove);
+    }
+    if kind == HostKind::Core
+        && matches!(
+            cli.command,
+            Action::Space { .. } | Action::Restore { recreate: true, .. }
+        )
+    {
+        bail!("{CORE_UNSUPPORTED}");
+    }
     if let Ok(id) = std::env::var("HERDR_PLUGIN_ID") {
         ensure!(id == PLUGIN_ID, "wrong plugin identity");
     }
-    let config_dir = env_path(cli.config_dir, "HERDR_PLUGIN_CONFIG_DIR")?;
+    let config_dir = config_dir_for(kind, cli.config_dir)?;
     let config = store::load_config(&config_dir)?;
     if matches!(cli.command, Action::Event) && !config.auto_save && !config.auto_restore {
         return Ok(json!({"status": "disabled"}));
@@ -347,12 +967,28 @@ pub fn run(cli: Cli) -> Result<Value> {
     if matches!(cli.command, Action::Autosave { force: false }) && !config.auto_save {
         return Ok(json!({"status": "disabled"}));
     }
-    let state_dir = env_path(cli.state_dir, "HERDR_PLUGIN_STATE_DIR")?;
-    let (socket, session) = store::session_identity(&env_path(cli.socket, "HERDR_SOCKET_PATH")?)?;
+    // The hook's saves carry --force, and a shell started while auto_save
+    // was on keeps sending them: the setting decides, not the shell's age.
+    if matches!(cli.command, Action::Autosave { force: true })
+        && kind == HostKind::Core
+        && std::env::var_os("REVIVE_SHELL_PID").is_some()
+        && !config.auto_save
+    {
+        return Ok(json!({"status": "disabled"}));
+    }
+    let state_dir = state_dir_for(kind, cli.state_dir)?;
+    let (socket, session) = socket_for(kind, cli.socket)?;
     let store = Store::new(&state_dir, session)?;
     let force_save = matches!(cli.command, Action::Autosave { force: true });
-    let hook = matches!(cli.command, Action::Event | Action::Autosave { .. });
-    let mut acquired = store.try_lock()?;
+    let hook = matches!(
+        cli.command,
+        Action::Event | Action::Autosave { .. } | Action::Status
+    );
+    let mut acquired = if kind == HostKind::Core && force_save {
+        Some(wait_lock(&store, &config)?)
+    } else {
+        store.try_lock()?
+    };
     let contended_event =
         acquired.is_none() && hook && std::env::var_os("HERDR_PLUGIN_EVENT").is_some();
     // Real lifecycle notifications must not disappear behind a capture that
@@ -389,9 +1025,20 @@ pub fn run(cli: Cli) -> Result<Value> {
     let binary = cli
         .herdr_bin
         .or_else(|| std::env::var_os("HERDR_BIN_PATH").map(PathBuf::from));
-    let mut host = Transport::new(socket.clone(), binary, &config);
+    let mut host = match kind {
+        HostKind::Herdr => HostImpl::Herdr(Transport::new(socket.clone(), binary, &config)),
+        HostKind::Core => HostImpl::Core(CoreHost::connect(&socket, &config, RunMode::Send)?),
+    };
+    if let HostImpl::Core(core) = &mut host
+        && force_save
+        && !hook_shell_is_current(core)?
+    {
+        return Ok(json!({"status": "skipped", "reason": "shell replaced"}));
+    }
     let result = match cli.command {
-        Action::Config | Action::Timer { .. } => unreachable!(),
+        Action::Config | Action::Timer { .. } | Action::Init { .. } | Action::Install { .. } => {
+            unreachable!()
+        }
         Action::Restore {
             snapshot,
             dry_run,
@@ -402,6 +1049,7 @@ pub fn run(cli: Cli) -> Result<Value> {
             if dry_run {
                 crate::layout::preview(&saved, &config)?
             } else {
+                ensure!(host.supports_layout(), "{CORE_UNSUPPORTED}");
                 crate::layout::rebuild(&mut host, &store, &socket, &config_dir, &saved, true)?
             }
         }
@@ -435,7 +1083,11 @@ pub fn run(cli: Cli) -> Result<Value> {
         Action::Event | Action::Autosave { .. } => {
             require_clear(&store)?;
             let generation = platform::generation(&socket)?;
-            if !force_save && config.auto_restore && boot(&store, &generation)?.is_none() {
+            if kind == HostKind::Herdr
+                && !force_save
+                && config.auto_restore
+                && boot(&store, &generation)?.is_none()
+            {
                 let path = store.snapshot_path(None)?;
                 match std::fs::symlink_metadata(&path) {
                     Ok(_) => restore(
@@ -538,6 +1190,7 @@ pub fn run(cli: Cli) -> Result<Value> {
                 json!({"status": "deleted"})
             }
         },
+        Action::Status => status(&mut host, &store, &config_dir, &config, kind)?,
         Action::Recovery { command } => match command {
             RecoveryAction::Inspect => {
                 json!({"pending": pending(&store)?, "rebuild": crate::layout::pending(&store)?, "boots": store.list("boots")?})
@@ -560,7 +1213,7 @@ pub fn run(cli: Cli) -> Result<Value> {
         },
     };
     Ok(
-        json!({"result": result, "requests": host.requests, "herdr_children": host.children, "identity_connections": platform::identity_connections()}),
+        json!({"result": result, "requests": host.requests(), "herdr_children": host.children(), "identity_connections": platform::identity_connections()}),
     )
 }
 
@@ -569,6 +1222,11 @@ pub fn run(cli: Cli) -> Result<Value> {
 struct SaveTime {
     generation: String,
     time_ms: u64,
+    /// Panes this save carried forward from the snapshot a core recovery
+    /// started from; only the next automatic save in this generation may
+    /// carry them again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    carried: Vec<String>,
 }
 
 // Only agent lifecycle events need this check. Ordinary debounced events keep
@@ -654,8 +1312,51 @@ fn retain_autosaved_agents(snapshot: &mut Snapshot, previous: &Snapshot) -> usiz
     retained
 }
 
+/// During a core recovery each pane is relaunched by its own shell's `init`.
+/// Until that init has recorded the pane in this generation's boot record,
+/// the shell may still be reading its rc file (`startup`): capture then
+/// records the shell itself, or drops a terminal that is not live yet, and
+/// the pane's relaunch would read that. Such a pane keeps the entry the
+/// recovery started from. Any other capture is the pane's real state and ends
+/// the carry, also for panes whose init never records them. The candidates are
+/// every pane of a snapshot saved before this generation, or, once this
+/// generation has saved, the panes its last save carried, so a pane that
+/// first appeared in this generation is always captured live.
+fn carry_unrelaunched(
+    snapshot: &mut Snapshot,
+    previous: &Snapshot,
+    last: Option<&SaveTime>,
+    handled: &std::collections::HashSet<String>,
+    listed: &std::collections::HashSet<String>,
+    startup: &std::collections::HashSet<String>,
+    generation: &str,
+) -> Vec<String> {
+    let candidates: Vec<&str> = match last {
+        Some(last) if last.generation == generation => {
+            last.carried.iter().map(String::as_str).collect()
+        }
+        _ => previous.panes.iter().map(|p| p.pane_id.as_str()).collect(),
+    };
+    let mut carried = Vec::new();
+    for id in candidates {
+        if handled.contains(id) || !listed.contains(id) {
+            continue;
+        }
+        let Some(old) = previous.panes.iter().find(|p| p.pane_id == id) else {
+            continue;
+        };
+        match snapshot.panes.iter_mut().find(|p| p.pane_id == id) {
+            None => snapshot.panes.push(old.clone()),
+            Some(pane) if startup.contains(id) => pane.clone_from(old),
+            Some(_) => continue,
+        }
+        carried.push(id.to_string());
+    }
+    carried
+}
+
 fn save(
-    host: &mut impl Host,
+    host: &mut HostImpl,
     store: &Store,
     socket: &Path,
     config: &Config,
@@ -669,35 +1370,79 @@ fn save(
     }
     let generation = platform::generation(socket)?;
     let mut snapshot = capture::capture(host, &store.session, workspace, config)?;
-    let mut retained_agents = 0;
-    if automatic
-        && snapshot.panes.iter().any(|pane| pane.command.is_none())
-        && let Some(previous) = maybe_json::<Snapshot>(&store.snapshot_path(None)?)?
+    let core_recovery = automatic && config.auto_restore && matches!(host, HostImpl::Core(_));
+    let previous = if automatic
+        && (core_recovery || snapshot.panes.iter().any(|pane| pane.command.is_none()))
     {
+        maybe_json::<Snapshot>(&store.snapshot_path(None)?)?
+    } else {
+        None
+    };
+    let mut retained_agents = 0;
+    let mut carried = Vec::new();
+    if let Some(previous) = &previous {
         previous.validate()?;
         ensure!(
             previous.session == store.session,
             "cross-session snapshot refused"
         );
-        retained_agents = retain_autosaved_agents(&mut snapshot, &previous);
+        retained_agents = retain_autosaved_agents(&mut snapshot, previous);
+        if core_recovery && let HostImpl::Core(core) = host {
+            let last: Option<SaveTime> = maybe_json(&store.root.join("last-save.json"))?;
+            let handled = boot(store, &generation)?
+                .map(|record| record.entries.into_iter().map(|e| e.pane_id).collect())
+                .unwrap_or_default();
+            carried = carry_unrelaunched(
+                &mut snapshot,
+                previous,
+                last.as_ref(),
+                &handled,
+                core.listed_panes(),
+                core.startup_panes(),
+                &generation,
+            );
+        }
     }
     ensure!(
         platform::generation(socket)? == generation,
         "server changed during capture"
     );
-    store.save(&snapshot, name, config.retention)?;
+    // The herdr-core hook saves at every allowlisted command and prompt,
+    // forced, with no debounce: one that changes nothing but the time is not
+    // archived again, or it would push the distinct states out of retention;
+    // only the latest snapshot takes its time.
+    let unchanged = name.is_none()
+        && std::env::var_os("REVIVE_SHELL_PID").is_some()
+        && matches!(host, HostImpl::Core(_))
+        && store
+            .read_snapshot(&store.snapshot_path(None)?)
+            .is_ok_and(|latest| {
+                Snapshot {
+                    created_ms: snapshot.created_ms,
+                    ..latest
+                } == snapshot
+            });
+    if unchanged {
+        store.refresh_latest(&snapshot)?;
+    } else {
+        store.save(&snapshot, name, config.retention)?;
+    }
+    let carried_panes = carried.len();
     if name.is_none() {
         store::atomic_json(
             &store.root.join("last-save.json"),
             &SaveTime {
                 generation,
                 time_ms: store::now_ms()?,
+                carried,
             },
         )?;
     }
-    Ok(
-        json!({"status": "saved", "panes": snapshot.panes.len(), "retained_agents": retained_agents, "path": store.snapshot_path(name)?}),
-    )
+    let mut result = json!({"status": "saved", "panes": snapshot.panes.len(), "retained_agents": retained_agents, "path": store.snapshot_path(name)?});
+    if matches!(host, HostImpl::Core(_)) {
+        result["carried_panes"] = json!(carried_panes);
+    }
+    Ok(result)
 }
 
 fn read_selected(store: &Store, file: Option<&Path>, name: Option<&str>) -> Result<Snapshot> {
@@ -763,12 +1508,87 @@ fn manual_restore(
             json!({"plan":plan, "reconstruction":reconstruction, "execution_revalidation_required":true}),
         );
     }
+    ensure!(
+        reconstruction.is_none() || host.supports_layout(),
+        "{CORE_UNSUPPORTED}"
+    );
     let mut result = restore(host, store, socket, config_dir, config, file, None, false)?;
     if reconstruction.is_some() {
         result["reconstruction"] =
             crate::layout::rebuild(host, store, socket, config_dir, &missing, true)?;
     }
     Ok(result)
+}
+
+fn status(
+    host: &mut impl Host,
+    store: &Store,
+    config_dir: &Path,
+    config: &Config,
+    kind: HostKind,
+) -> Result<Value> {
+    let latest_path = store.snapshot_path(None)?;
+    let (latest, panes) = match maybe_json::<Snapshot>(&latest_path)? {
+        Some(saved) => {
+            saved.validate()?;
+            ensure!(
+                saved.session == store.session,
+                "cross-session snapshot refused"
+            );
+            let plan = planner::plan(&saved, &store.session, &host.snapshot()?, config)?;
+            let panes: Vec<Value> = plan
+                .entries
+                .iter()
+                .map(|entry| {
+                    let pane = saved.panes.iter().find(|p| p.pane_id == entry.pane_id);
+                    json!({
+                        "pane_id": entry.pane_id,
+                        "terminal_id": entry.terminal_id,
+                        "decision": entry.decision,
+                        "cwd": pane.map(|p| p.cwd.clone()),
+                        "program": pane
+                            .and_then(|p| p.command.as_ref())
+                            .and_then(|command| command.argv().ok())
+                            .and_then(|argv| argv.first().cloned()),
+                    })
+                })
+                .collect();
+            (
+                Some(json!({
+                    "path": latest_path,
+                    "created_ms": saved.created_ms,
+                    "panes": saved.panes.len(),
+                    "commands": saved.panes.iter().filter(|p| p.command.is_some()).count(),
+                })),
+                Some(panes),
+            )
+        }
+        None => (None, None),
+    };
+    let install = match kind {
+        HostKind::Core => crate::core::install::inspect(&crate::core::paths::home_dir()?),
+        HostKind::Herdr => Value::Null,
+    };
+    Ok(json!({
+        "host": kind,
+        "session": store.session,
+        "latest": latest,
+        "panes": panes,
+        "snapshots": store.list("snapshots")?,
+        "recovery": {
+            "pending": pending(store)?,
+            "rebuild": crate::layout::pending(store)?,
+            "boots": store.list("boots")?,
+        },
+        "config": {
+            "dir": config_dir,
+            "present": config_dir.join("config.toml").exists(),
+            "auto_save": config.auto_save,
+            "auto_restore": config.auto_restore,
+            "allowed_programs": config.allowed_programs,
+        },
+        "install": install,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -919,4 +1739,25 @@ fn import_space(
     saved.validate()?;
     store.save(&saved, Some(name), config.retention)?;
     Ok(json!({"status": "imported_without_execution"}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_paths_imply_the_herdr_host_outside_a_plugin() {
+        // Only meaningful when neither variable is ambient in the test run.
+        if std::env::var_os("HERDR_PLUGIN_STATE_DIR").is_some()
+            || std::env::var_os("HERDR_REVIVE_HOST").is_some()
+        {
+            return;
+        }
+        assert!(HostKind::resolve(None, false).is_err());
+        assert_eq!(HostKind::resolve(None, true).unwrap(), HostKind::Herdr);
+        assert_eq!(
+            HostKind::resolve(Some(HostKind::Core), true).unwrap(),
+            HostKind::Core
+        );
+    }
 }

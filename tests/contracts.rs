@@ -1104,3 +1104,399 @@ fn custom_agent_launcher_is_selected_by_environment_and_current_policy() {
     cfg.agent_launchers.clear();
     assert!(cmd.allowed_argv(&cfg).is_err());
 }
+
+#[test]
+fn hosts_support_layout_unless_they_opt_out() {
+    struct NoLayout;
+    impl Host for NoLayout {
+        fn supports_layout(&self) -> bool {
+            false
+        }
+        fn snapshot(&mut self) -> Result<LiveSnapshot> {
+            Ok(live())
+        }
+        fn process_info(&mut self, _: &str) -> Result<ProcessInfo> {
+            bail!("unused")
+        }
+        fn pane(&mut self, _: &str) -> Result<LivePane> {
+            bail!("unused")
+        }
+        fn run(&mut self, _: &str, _: &str) -> Result<()> {
+            bail!("unused")
+        }
+    }
+    assert!(
+        Fake {
+            runs: 0,
+            fail: false
+        }
+        .supports_layout()
+    );
+    assert!(!NoLayout.supports_layout());
+    assert!(
+        format!(
+            "{:#}",
+            NoLayout
+                .api("layout.export", json!({}), "layout_export")
+                .unwrap_err()
+        )
+        .contains("layout")
+    );
+}
+
+#[test]
+fn startup_shell_requires_the_parent_shell_in_its_own_foreground_group() {
+    let info = ProcessInfo {
+        pane_id: "w1:p1".into(),
+        shell_pid: Some(std::process::id()),
+        foreground_process_group_id: None,
+        foreground_processes: vec![],
+    };
+    assert!(
+        platform::startup_shell(&info, std::process::id() + 1)
+            .unwrap()
+            .is_none()
+    );
+    let missing = ProcessInfo {
+        shell_pid: None,
+        ..info
+    };
+    assert!(platform::startup_shell(&missing, 1).is_err());
+}
+
+struct IdleBash(std::process::Child);
+impl IdleBash {
+    fn spawn() -> Self {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("bash")
+            .arg("--norc")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        Self(child)
+    }
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+    fn info(&self, group: u32, foreground: &[u32]) -> ProcessInfo {
+        ProcessInfo {
+            pane_id: "w1:p1".into(),
+            shell_pid: Some(self.pid()),
+            foreground_process_group_id: Some(group),
+            foreground_processes: foreground
+                .iter()
+                .map(|&pid| ForegroundProcess { pid })
+                .collect(),
+        }
+    }
+}
+impl Drop for IdleBash {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn startup_shell_accepts_only_an_idle_parent_shell() {
+    let shell = IdleBash::spawn();
+    let pid = shell.pid();
+    for foreground in [&[pid][..], &[pid, 1]] {
+        assert_eq!(
+            platform::startup_shell(&shell.info(pid, foreground), pid)
+                .unwrap()
+                .as_deref(),
+            Some("bash"),
+            "{foreground:?}"
+        );
+    }
+    for info in [
+        shell.info(pid + 1, &[pid]),
+        shell.info(pid + 1, &[pid + 1]),
+        shell.info(pid, &[1]),
+        shell.info(pid, &[]),
+    ] {
+        assert!(platform::startup_shell(&info, pid).unwrap().is_none());
+    }
+}
+
+#[test]
+fn capture_skips_layout_export_for_hosts_without_layout() {
+    struct IdleNoLayout(IdleBash);
+    impl Host for IdleNoLayout {
+        fn supports_layout(&self) -> bool {
+            false
+        }
+        fn snapshot(&mut self) -> Result<LiveSnapshot> {
+            Ok(live())
+        }
+        fn process_info(&mut self, _: &str) -> Result<ProcessInfo> {
+            let pid = self.0.pid();
+            Ok(self.0.info(pid, &[pid]))
+        }
+        fn pane(&mut self, _: &str) -> Result<LivePane> {
+            bail!("unused")
+        }
+        fn run(&mut self, _: &str, _: &str) -> Result<()> {
+            bail!("unused")
+        }
+        fn api(
+            &mut self,
+            method: &str,
+            _: serde_json::Value,
+            _: &str,
+        ) -> Result<serde_json::Value> {
+            panic!("unexpected api call: {method}")
+        }
+    }
+    let mut host = IdleNoLayout(IdleBash::spawn());
+    let snapshot = capture::capture(&mut host, &"a".repeat(64), None, &config()).unwrap();
+    assert_eq!(snapshot.panes.len(), 1);
+    assert!(snapshot.layout.is_empty());
+}
+
+#[test]
+fn per_pane_relaunch_journals_one_entry_per_pane_per_generation() {
+    let t = tempfile::tempdir().unwrap();
+    let mut s = saved();
+    s.panes.push(SavedPane {
+        workspace_id: "w1".into(),
+        tab_id: "w1:t1".into(),
+        pane_id: "w1:p2".into(),
+        cwd: "/tmp".into(),
+        command: Some(CommandSpec::Program {
+            argv: vec!["ssh".into(), "two".into()],
+        }),
+    });
+    let store = store::Store::new(t.path(), s.session.clone()).unwrap();
+    let lock = store.try_lock().unwrap().unwrap();
+    let mut live = live();
+    live.panes.push(LivePane {
+        workspace_id: "w1".into(),
+        tab_id: "w1:t1".into(),
+        pane_id: "w1:p2".into(),
+        terminal_id: "term_2".into(),
+        cwd: Some("/tmp".into()),
+        agent: None,
+        agent_session: None,
+    });
+    let plan = planner::plan(&s, &s.session, &live, &config()).unwrap();
+    let mut host = Fake {
+        runs: 0,
+        fail: false,
+    };
+    let generation = "c".repeat(64);
+    let first = app::execute_pane(
+        &mut host,
+        &store,
+        &lock,
+        &s,
+        &s.panes[0],
+        &plan.entries[0],
+        &generation,
+        |_, _, _, _| Ok(Some("one".into())),
+    )
+    .unwrap();
+    assert_eq!(first, Some(app::Outcome::Applied));
+    assert_eq!(host.runs, 1);
+    assert!(app::pending(&store).unwrap().is_none());
+    let record = app::boot(&store, &generation).unwrap().unwrap();
+    assert_eq!(record.entries.len(), 1);
+    assert_eq!(record.state, app::BootState::Done);
+
+    let again = app::execute_pane(
+        &mut host,
+        &store,
+        &lock,
+        &s,
+        &s.panes[0],
+        &plan.entries[0],
+        &generation,
+        |_, _, _, _| Ok(Some("duplicate".into())),
+    )
+    .unwrap();
+    assert_eq!(again, None);
+    assert_eq!(host.runs, 1);
+
+    let second = app::execute_pane(
+        &mut host,
+        &store,
+        &lock,
+        &s,
+        &s.panes[1],
+        &plan.entries[1],
+        &generation,
+        |_, _, _, _| Ok(None),
+    )
+    .unwrap();
+    assert_eq!(second, Some(app::Outcome::Skipped));
+    let record = app::boot(&store, &generation).unwrap().unwrap();
+    assert_eq!(record.entries.len(), 2);
+    assert_eq!(record.entries[1].outcome, app::Outcome::Skipped);
+
+    let next = "d".repeat(64);
+    let fresh = app::execute_pane(
+        &mut host,
+        &store,
+        &lock,
+        &s,
+        &s.panes[0],
+        &plan.entries[0],
+        &next,
+        |_, _, _, _| Ok(Some("again".into())),
+    )
+    .unwrap();
+    assert_eq!(fresh, Some(app::Outcome::Applied));
+    assert_eq!(host.runs, 2);
+    assert_eq!(store.list("boots").unwrap().len(), 2);
+}
+
+#[test]
+fn per_pane_relaunch_failure_blocks_until_acknowledged() {
+    let t = tempfile::tempdir().unwrap();
+    let s = saved();
+    let store = store::Store::new(t.path(), s.session.clone()).unwrap();
+    let lock = store.try_lock().unwrap().unwrap();
+    let plan = planner::plan(&s, &s.session, &live(), &config()).unwrap();
+    let mut host = Fake {
+        runs: 0,
+        fail: true,
+    };
+    let generation = "e".repeat(64);
+    let relaunch = |host: &mut Fake, store: &store::Store| {
+        app::execute_pane(
+            host,
+            store,
+            &lock,
+            &s,
+            &s.panes[0],
+            &plan.entries[0],
+            &generation,
+            |_, _, _, _| Ok(Some("boom".into())),
+        )
+    };
+    assert!(relaunch(&mut host, &store).is_err());
+    assert_eq!(host.runs, 1);
+    let mut evidence = app::pending(&store).unwrap().unwrap();
+    assert_eq!(evidence.state, app::BootState::Failed);
+    assert_eq!(evidence.entries[0].outcome, app::Outcome::Failed);
+    assert!(app::require_clear(&store).is_err());
+    assert!(relaunch(&mut host, &store).is_err());
+    assert_eq!(host.runs, 1);
+    evidence.state = app::BootState::Done;
+    evidence.acknowledged = true;
+    app::finish(&store, &evidence).unwrap();
+    assert_eq!(relaunch(&mut host, &store).unwrap(), None);
+    assert_eq!(host.runs, 1);
+}
+
+#[test]
+fn per_pane_relaunch_journals_non_candidates_as_skipped_without_running() {
+    let t = tempfile::tempdir().unwrap();
+    let mut s = saved();
+    s.panes[0].command = None;
+    let store = store::Store::new(t.path(), s.session.clone()).unwrap();
+    let lock = store.try_lock().unwrap().unwrap();
+    let plan = planner::plan(&s, &s.session, &live(), &config()).unwrap();
+    assert_eq!(plan.entries[0].decision, planner::Decision::NoCommand);
+    let mut host = Fake {
+        runs: 0,
+        fail: false,
+    };
+    let outcome = app::execute_pane(
+        &mut host,
+        &store,
+        &lock,
+        &s,
+        &s.panes[0],
+        &plan.entries[0],
+        &"f".repeat(64),
+        |_, _, _, _| panic!("never revalidated"),
+    )
+    .unwrap();
+    assert_eq!(outcome, Some(app::Outcome::Skipped));
+    assert_eq!(host.runs, 0);
+    assert_eq!(
+        app::boot(&store, &"f".repeat(64)).unwrap().unwrap().entries[0].outcome,
+        app::Outcome::Skipped
+    );
+}
+
+#[test]
+fn per_pane_relaunch_persists_sending_and_reopens_an_acknowledged_record() {
+    let t = tempfile::tempdir().unwrap();
+    let mut s = saved();
+    s.panes.push(SavedPane {
+        workspace_id: "w1".into(),
+        tab_id: "w1:t1".into(),
+        pane_id: "w1:p2".into(),
+        cwd: "/tmp".into(),
+        command: Some(CommandSpec::Program {
+            argv: vec!["ssh".into(), "two".into()],
+        }),
+    });
+    let store = store::Store::new(t.path(), s.session.clone()).unwrap();
+    let lock = store.try_lock().unwrap().unwrap();
+    let mut live = live();
+    live.panes.push(LivePane {
+        workspace_id: "w1".into(),
+        tab_id: "w1:t1".into(),
+        pane_id: "w1:p2".into(),
+        terminal_id: "term_2".into(),
+        cwd: Some("/tmp".into()),
+        agent: None,
+        agent_session: None,
+    });
+    let plan = planner::plan(&s, &s.session, &live, &config()).unwrap();
+    let mut host = Fake {
+        runs: 0,
+        fail: true,
+    };
+    let generation = "a".repeat(64);
+    assert!(
+        app::execute_pane(
+            &mut host,
+            &store,
+            &lock,
+            &s,
+            &s.panes[0],
+            &plan.entries[0],
+            &generation,
+            |_, _, _, _| Ok(Some("boom".into())),
+        )
+        .is_err()
+    );
+    let mut evidence = app::pending(&store).unwrap().unwrap();
+    let hash = evidence.snapshot_hash.clone();
+    evidence.state = app::BootState::Done;
+    evidence.acknowledged = true;
+    app::finish(&store, &evidence).unwrap();
+
+    host.fail = false;
+    let outcome = app::execute_pane(
+        &mut host,
+        &store,
+        &lock,
+        &s,
+        &s.panes[1],
+        &plan.entries[1],
+        &generation,
+        |entry, _, _, _| {
+            assert_eq!(entry.outcome, app::Outcome::Sending);
+            let pending = app::pending(&store).unwrap().unwrap();
+            assert_eq!(pending.entries[1].outcome, app::Outcome::Sending);
+            assert!(!pending.acknowledged);
+            Ok(Some("two".into()))
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome, Some(app::Outcome::Applied));
+    let record = app::boot(&store, &generation).unwrap().unwrap();
+    assert!(!record.acknowledged);
+    assert_eq!(record.snapshot_hash, hash);
+    assert_eq!(record.entries[0].outcome, app::Outcome::Failed);
+    assert_eq!(record.entries[1].outcome, app::Outcome::Applied);
+}

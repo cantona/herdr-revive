@@ -219,6 +219,18 @@ impl Store {
         );
         Ok(snapshot)
     }
+    /// Rewrites the session's latest snapshot without archiving it: for a
+    /// save that changes nothing but its time.
+    pub fn refresh_latest(&self, snapshot: &Snapshot) -> Result<()> {
+        snapshot.validate()?;
+        ensure!(
+            snapshot.session == self.session,
+            "snapshot session mismatch"
+        );
+        let bytes = serde_json::to_vec_pretty(snapshot)?;
+        ensure!(bytes.len() <= MAX_BYTES, "output exceeds size limit");
+        atomic_write(&self.snapshot_path(None)?, &bytes)
+    }
     pub fn save(&self, snapshot: &Snapshot, name: Option<&str>, retention: usize) -> Result<()> {
         snapshot.validate()?;
         ensure!(
