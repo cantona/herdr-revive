@@ -111,8 +111,12 @@ pub fn idle_shell(info: &ProcessInfo) -> Result<Option<String>> {
     if has_children(&shell)? {
         return Ok(None);
     }
-    let (argv, _) = argv_and_cwd(&shell)?;
-    let exe = executable(pid)?;
+    Ok(Some(interactive_shell_name(&shell)?))
+}
+
+fn interactive_shell_name(shell: &Process) -> Result<String> {
+    let (argv, _) = argv_and_cwd(shell)?;
+    let exe = executable(shell.pid)?;
     let name = exe
         .file_name()
         .and_then(|s| s.to_str())
@@ -135,7 +139,28 @@ pub fn idle_shell(info: &ProcessInfo) -> Result<Option<String>> {
             .any(|a| a == "-c" || (a.starts_with('-') && !a.starts_with("--") && a.contains('c'))),
         "noninteractive shell refused"
     );
-    Ok(Some(name.into()))
+    Ok(name.into())
+}
+
+/// The shell evaluating revive's own `init` output: this process's parent,
+/// an interactive shell holding its terminal's foreground group, and itself a
+/// member of that group. Other members of the shell's own group are ignored:
+/// while bash reads its startup files it has no job control, so a `cmd &`
+/// there joins the shell's group, and no foreground command can exist yet.
+/// A foreign foreground group means a command is already running there and
+/// the relaunch is skipped.
+pub fn startup_shell(info: &ProcessInfo, parent: u32) -> Result<Option<String>> {
+    let pid = info.shell_pid.context("shell PID unavailable")?;
+    if pid != parent || !is_shell_process(pid)? {
+        return Ok(None);
+    }
+    let shell = process(pid)?;
+    if info.foreground_process_group_id != Some(shell.group)
+        || !info.foreground_processes.iter().any(|p| p.pid == pid)
+    {
+        return Ok(None);
+    }
+    Ok(Some(interactive_shell_name(&shell)?))
 }
 
 pub fn shell_command(shell: &str, cwd: &str, argv: &[String]) -> Result<String> {

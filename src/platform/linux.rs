@@ -37,6 +37,25 @@ pub fn process(pid: u32) -> Result<Process> {
     )
 }
 
+/// Field 8 of `/proc/<pid>/stat`: the foreground process group of the
+/// process's controlling terminal, as the kernel sees it right now.
+pub fn parse_tpgid(text: &str) -> Result<u32> {
+    let (_, fields) = text.rsplit_once(") ").context("invalid process stat")?;
+    let tpgid: i64 = fields
+        .split_whitespace()
+        .nth(5)
+        .context("missing terminal process group")?
+        .parse()?;
+    ensure!(tpgid > 0, "process has no controlling terminal");
+    Ok(u32::try_from(tpgid)?)
+}
+
+pub fn terminal_foreground_group(shell: u32) -> Result<u32> {
+    parse_tpgid(
+        &read_proc_text(format!("/proc/{shell}/stat")).context("shell identity unavailable")?,
+    )
+}
+
 pub fn process_table() -> Result<HashMap<u32, Process>> {
     let mut table = HashMap::new();
     for entry in std::fs::read_dir("/proc")? {
@@ -451,5 +470,15 @@ mod tests {
         stop_tx.send(()).unwrap();
         worker.join().unwrap();
         assert!(result.unwrap());
+    }
+
+    #[test]
+    fn terminal_process_group_comes_from_stat_field_eight() {
+        let line = "4242 (bash) S 1 4242 4242 34816 5151 4194560 100 0 0 0 1 1 0 0 20 0 1 0 12345 1 1 18446744073709551615";
+        assert_eq!(parse_tpgid(line).unwrap(), 5151);
+        let detached = "4242 (bash) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 12345";
+        assert!(parse_tpgid(detached).is_err());
+        let spaced = "7 (a b) c) S 1 7 7 34816 9 0 0 0 0 0 0 0 0 0 20 0 1 0 1";
+        assert_eq!(parse_tpgid(spaced).unwrap(), 9);
     }
 }

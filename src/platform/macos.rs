@@ -56,6 +56,15 @@ pub fn process(id: u32) -> Result<Process> {
     })
 }
 
+pub fn terminal_foreground_group(shell: u32) -> Result<u32> {
+    let info = bsd_info(shell)?;
+    ensure!(
+        info.e_tpgid > 0 && i32::try_from(info.e_tpgid).is_ok(),
+        "process has no controlling terminal"
+    );
+    Ok(info.e_tpgid)
+}
+
 pub fn process_table() -> Result<HashMap<u32, Process>> {
     let mut capacity = 1024;
     let pids = loop {
