@@ -9,7 +9,7 @@ platforms = ["linux", "macos"]
 command = ["cargo", "build", "--release", "--locked"]
 
 [[startup]]
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[panes]]
 id = "manage"
@@ -29,51 +29,51 @@ command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HE
 id = "save"
 title = "Save session snapshot"
 contexts = ["workspace"]
-command = ["target/release/herdr-revive", "save"]
+command = ["target/release/herdr-revive", "--host", "herdr", "save"]
 
 [[actions]]
 id = "preview"
 title = "Preview session restore"
 contexts = ["workspace"]
-command = ["target/release/herdr-revive", "preview"]
+command = ["target/release/herdr-revive", "--host", "herdr", "preview"]
 
 [[actions]]
 id = "restore"
 title = "Restore session snapshot"
 contexts = ["workspace"]
-command = ["target/release/herdr-revive", "restore"]
+command = ["target/release/herdr-revive", "--host", "herdr", "restore"]
 
 [[actions]]
 id = "autosave"
 title = "Run configured autosave"
 contexts = ["workspace"]
-command = ["target/release/herdr-revive", "autosave"]
+command = ["target/release/herdr-revive", "--host", "herdr", "autosave"]
 
 [[actions]]
 id = "list"
 title = "List saved sessions"
 contexts = ["workspace"]
-command = ["target/release/herdr-revive", "list"]
+command = ["target/release/herdr-revive", "--host", "herdr", "list"]
 
 [[events]]
 on = "pane.agent_detected"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[events]]
 on = "pane.agent_status_changed"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[events]]
 on = "pane.exited"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[events]]
 on = "workspace.created"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[events]]
 on = "tab.created"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[panes]]
 id = "save-space"
@@ -121,7 +121,7 @@ command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HE
 id = "autosave"
 title = "herdr-revive periodic autosave"
 placement = "split"
-command = ["target/release/herdr-revive", "timer"]
+command = ["target/release/herdr-revive", "--host", "herdr", "timer"]
 
 [[actions]]
 id = "timer"
@@ -131,24 +131,24 @@ command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HE
 
 [[events]]
 on = "workspace.closed"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[events]]
 on = "workspace.renamed"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[events]]
 on = "tab.closed"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[events]]
 on = "tab.renamed"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[events]]
 on = "pane.created"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]
 
 [[events]]
 on = "pane.closed"
-command = ["target/release/herdr-revive", "event"]
+command = ["target/release/herdr-revive", "--host", "herdr", "event"]

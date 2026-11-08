@@ -55,7 +55,7 @@ def main():
             start = time.perf_counter_ns()
             result = subprocess.run(["/usr/bin/time", "-f",
                 '{"rss_kib":%M,"user_s":%U,"system_s":%S}', "-o", str(timing),
-                str(BINARY), operation], env=fixture.env(), capture_output=True, text=True, check=True)
+                *fixture.argv(operation)], env=fixture.env(), capture_output=True, text=True, check=True)
             elapsed = (time.perf_counter_ns() - start) / 1e6
             measurement = json.loads(timing.read_text())
             output = json.loads(result.stdout)

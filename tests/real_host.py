@@ -66,7 +66,7 @@ class RealHost(unittest.TestCase):
             return reply["result"]
 
     def run_cli(self,*args,ok=True):
-        result = subprocess.run([str(BIN),*args],env=self.env,capture_output=True,text=True,timeout=15)
+        result = subprocess.run([str(BIN),"--host","herdr",*args],env=self.env,capture_output=True,text=True,timeout=15)
         self.assertEqual(result.returncode==0,ok,result.stderr)
         return json.loads(result.stdout) if ok else result
 

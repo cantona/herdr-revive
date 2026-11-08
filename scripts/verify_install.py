@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory(prefix="herdr-revive-install-", dir="/tmp") as 
         assert managed_root.is_relative_to(root)
         env.update(HERDR_PLUGIN_ROOT=str(managed_root), HERDR_PLUGIN_CONFIG_DIR=str(config_dir),
                    HERDR_PLUGIN_STATE_DIR=str(state_marker.parent), HERDR_PLUGIN_ID="cantona.herdr-revive")
-        subprocess.run(["target/release/herdr-revive", "event"], cwd=managed_root, env=env,
+        subprocess.run(["target/release/herdr-revive", "--host", "herdr", "event"], cwd=managed_root, env=env,
                        check=True, capture_output=True)
         subprocess.run(["sh", "scripts/manage.sh"], input="0\n", text=True, cwd=managed_root,
                        env=env, check=True, capture_output=True)
@@ -137,7 +137,7 @@ with tempfile.TemporaryDirectory(prefix="herdr-revive-install-", dir="/tmp") as 
     run("link", str(incompatible), "--disabled", success=False)
     env.update(HERDR_PLUGIN_ROOT=str(ROOT), HERDR_PLUGIN_CONFIG_DIR=str(config_dir),
                HERDR_PLUGIN_STATE_DIR=str(root / "runtime-state"), HERDR_PLUGIN_ID="cantona.herdr-revive")
-    subprocess.run(["target/release/herdr-revive", "event"], cwd=ROOT, env=env, check=True, capture_output=True)
+    subprocess.run(["target/release/herdr-revive", "--host", "herdr", "event"], cwd=ROOT, env=env, check=True, capture_output=True)
     subprocess.run(["sh", "scripts/manage.sh"], input="0\n", text=True, cwd=ROOT, env=env, check=True, capture_output=True)
     print(json.dumps(dict(manifest="accepted by actual Herdr parser", actions=10,
         isolated_link_enable_disable_relink_uninstall="passed", config_and_state_preserved=True,

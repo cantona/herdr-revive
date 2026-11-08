@@ -312,6 +312,51 @@ fn restore_on_core_refuses_a_layout_rebuild_before_any_send() {
     assert!(dirs.store(&core.socket).list("boots").unwrap().is_empty());
 }
 
+#[test]
+fn plugin_invocations_pin_the_herdr_host() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("herdr-plugin.toml")).unwrap()).unwrap();
+    let mut pinned = 0;
+    for (_, entries) in manifest.as_table().unwrap() {
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        for entry in entries {
+            let Some(command) = entry.get("command").and_then(toml::Value::as_array) else {
+                continue;
+            };
+            let argv: Vec<&str> = command.iter().map(|a| a.as_str().unwrap()).collect();
+            if argv[0].ends_with("herdr-revive") {
+                assert_eq!(argv[1..3], ["--host", "herdr"], "{argv:?}");
+                pinned += 1;
+            }
+        }
+    }
+    assert!(pinned > 0);
+    let script = std::fs::read_to_string(root.join("scripts/manage.sh")).unwrap();
+    let mut calls = 0;
+    for line in script.lines().filter(|l| l.contains("revive_bin")) {
+        if line.trim_start().starts_with("revive_bin=") {
+            continue;
+        }
+        for (at, _) in line.match_indices("revive_bin") {
+            let rest = &line[at + "revive_bin".len()..];
+            let rest = rest
+                .strip_prefix('"')
+                .or_else(|| rest.strip_prefix('}'))
+                .unwrap_or(rest);
+            let rest = rest.strip_prefix('"').unwrap_or(rest);
+            assert!(
+                rest.starts_with(" --host herdr"),
+                "every revive_bin use ($revive_bin, \"$revive_bin\", ${{revive_bin}}) outside the assignment must be followed by ` --host herdr`: {line}"
+            );
+            calls += 1;
+        }
+    }
+    assert!(calls > 0);
+}
+
 fn init_outcome(output: std::process::Output) -> (bool, String, String) {
     (
         output.status.success(),

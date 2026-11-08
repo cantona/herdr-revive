@@ -4,7 +4,7 @@ set -eu
 revive_bin="$HERDR_PLUGIN_ROOT/target/release/herdr-revive"
 
 pick_space() {
-    names=$("$revive_bin" space names) || return 1
+    names=$("$revive_bin" --host herdr space names) || return 1
     if [ -z "$names" ]; then
         printf 'No saved spaces.\n' >&2
         return 1
@@ -22,18 +22,18 @@ space_action() {
         save-space)
             printf 'Save this workspace as: '
             IFS= read -r name || return 1
-            "$revive_bin" space save "$name" ;;
+            "$revive_bin" --host herdr space save "$name" ;;
         open-space)
             pick_space || return 1
-            "$revive_bin" space preview "$name" || return 1
+            "$revive_bin" --host herdr space preview "$name" || return 1
             printf 'Open as a new workspace? Type open: '
             IFS= read -r answer || return 1
-            [ "$answer" != open ] || "$revive_bin" space open "$name" ;;
+            [ "$answer" != open ] || "$revive_bin" --host herdr space open "$name" ;;
         delete-space)
             pick_space || return 1
             printf 'Delete "%s"? Type delete: ' "$name"
             IFS= read -r answer || return 1
-            [ "$answer" != delete ] || "$revive_bin" space delete "$name" ;;
+            [ "$answer" != delete ] || "$revive_bin" --host herdr space delete "$name" ;;
     esac
 }
 
@@ -46,26 +46,26 @@ while :; do
     IFS= read -r choice || exit 0
     case "$choice" in
         0) exit 0 ;;
-        1) "$revive_bin" save || printf 'Save failed.\n' >&2 ;;
-        2) "$revive_bin" preview || printf 'Preview failed.\n' >&2 ;;
+        1) "$revive_bin" --host herdr save || printf 'Save failed.\n' >&2 ;;
+        2) "$revive_bin" --host herdr preview || printf 'Preview failed.\n' >&2 ;;
         3|9)
             if [ "$choice" = 9 ]; then
-                "$revive_bin" list || continue
+                "$revive_bin" --host herdr list || continue
                 printf 'Snapshot path: '
                 IFS= read -r snapshot || exit 0
                 set -- --snapshot "$snapshot"
             else
                 set --
             fi
-            "$revive_bin" preview "$@" || continue
+            "$revive_bin" --host herdr preview "$@" || continue
             printf 'Restore matching idle panes and missing workspaces? Type restore: '
             IFS= read -r answer || exit 0
-            [ "$answer" != restore ] || "$revive_bin" restore "$@" || printf 'Restore failed.\n' >&2 ;;
-        4) "$revive_bin" list || printf 'List failed.\n' >&2 ;;
+            [ "$answer" != restore ] || "$revive_bin" --host herdr restore "$@" || printf 'Restore failed.\n' >&2 ;;
+        4) "$revive_bin" --host herdr list || printf 'List failed.\n' >&2 ;;
         5) space_action save-space || printf 'Save cancelled or failed.\n' >&2 ;;
         6) space_action open-space || printf 'Open cancelled or failed.\n' >&2 ;;
         7) space_action delete-space || printf 'Delete cancelled or failed.\n' >&2 ;;
-        8) "$revive_bin" space list || printf 'List failed.\n' >&2 ;;
+        8) "$revive_bin" --host herdr space list || printf 'List failed.\n' >&2 ;;
         *) printf 'Choose a listed number.\n' ;;
     esac
 done

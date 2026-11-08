@@ -197,15 +197,21 @@ class Fixture:
                    HERDR_PLUGIN_ID="cantona.herdr-revive",
                    HERDR_SOCKET_PATH=str(self.socket_path),
                    HERDR_BIN_PATH=shutil.which("herdr") or "/missing/herdr",
-                   CLAUDE_CONFIG_DIR=str(self.root / "claude-config"))
+                   CLAUDE_CONFIG_DIR=str(self.root / "claude-config"),
+                   HERDR_REVIVE_HOST="core")
         if self.default_claude:
             env.pop("CLAUDE_CONFIG_DIR", None)
             env["HOME"] = str(self.root / "home")
         env.pop("HERDR_SESSION", None)
         return env
 
+    def argv(self, *args):
+        # Pinned like every herdr-plugin.toml command, so HERDR_REVIVE_HOST=core
+        # in env() proves the plugin's own invocations ignore it.
+        return [str(BINARY), "--host", "herdr", *args]
+
     def run(self, *args, ok=True):
-        result = subprocess.run([str(BINARY), *args], env=self.env(),
+        result = subprocess.run(self.argv(*args), env=self.env(),
                                 capture_output=True, text=True, timeout=10)
         if ok and result.returncode:
             raise AssertionError(result.stderr)
