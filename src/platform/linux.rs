@@ -55,6 +55,7 @@ pub fn process_table() -> Result<HashMap<u32, Process>> {
                 table.insert(pid, p);
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) if e.raw_os_error() == Some(nix::libc::ESRCH) => continue,
             Err(_) => bail!("process table is inaccessible"),
         }
     }
