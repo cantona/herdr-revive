@@ -5,3 +5,5 @@
 /.local/
 *.tmp
 __pycache__/
+mods/*/gpui-kit.d.ts
+mods/*/jsconfig.json
