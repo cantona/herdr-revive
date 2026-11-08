@@ -84,8 +84,9 @@ holds the session lock; or one of these error bodies:
 - `keys.json`: `{ "global": { "ctrl-alt-r": "mod.open:herdr-revive", "cmd-alt-r": "mod.open:herdr-revive" } }`,
   merged into the person's own `keys.json`.
 - `mods/herdr-revive/main.js`, one `View`:
-  - `exec("herdr-revive", ["--host","core","status"])` in `cx.spawn`, parsed
-    as JSON. The dialog draws `result.latest`, `result.panes`,
+  - `herdr-revive --host core status` in `cx.spawn`, run through
+    `exec("sh", ...)` so it is found as described under Watch out, and
+    parsed as JSON. The dialog draws `result.latest`, `result.panes`,
     `result.recovery.pending`, `result.config` and `result.install`; a
     top-level `{"status":"operation_in_progress"}` is the lock message.
   - The buttons run `herdr-revive --host core save`,
@@ -103,11 +104,10 @@ holds the session lock; or one of these error bodies:
   plugin's config, link the directory:
   `ln -s ~/.config/herdr/plugins/config/cantona.herdr-revive ~/.config/herdr-revive`.
   A symlinked `config.toml` itself is refused.
-- `herdr-revive` must be on the PATH the app process itself has: `exec`
-  runs it by bare name. `cargo install` puts it in `~/.cargo/bin`, which a
-  Linux desktop session started outside your shell may not have; link it
-  into a directory that session has (for example `~/.local/bin`) if the
-  dialog says herdr-revive could not be started.
+- The dialog runs `herdr-revive` from the app's PATH, else from
+  `~/.local/bin` or `~/.cargo/bin`, as the rc line does: an app started
+  from the desktop often has a bare PATH. Installed anywhere else, link it
+  into `~/.local/bin`.
 - Status is read once per open and after each button, never on a timer, so
   the dialog does not follow saves made elsewhere until Refresh.
 - `exec` inherits the app's `HC_SESSION`. A core started with another session
@@ -129,5 +129,6 @@ holds the session lock; or one of these error bodies:
 - `herdr-app check mods/herdr-revive` passes.
 - Opening with `ctrl-alt-r` (`cmd-alt-r` on macOS) shows the last snapshot's time.
 - "Save now" changes that time.
-- With `herdr-revive` off PATH, the dialog shows the install command.
+- With `herdr-revive` in none of those places, the dialog shows the
+  install command.
 - Esc closes the dialog.

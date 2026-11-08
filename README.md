@@ -7,6 +7,7 @@ them from retained snapshots or reusable named workspaces.
 An independent MIT-licensed Rust plugin by Su Kang Yin.
 Package/executable: `herdr-revive`; plugin: `cantona.herdr-revive`.
 **Supports Linux and macOS.** Windows remains planned.
+It also runs against the Herdr desktop app; see [Herdr desktop app](#herdr-desktop-app).
 
 ## Why this plugin exists
 
@@ -111,7 +112,7 @@ On macOS, install Xcode Command Line Tools (`xcode-select --install`) for the li
 Install the tagged source release; Herdr previews the manifest and builds it:
 
 ```sh
-herdr plugin install cantona/herdr-revive --ref v0.1.6
+herdr plugin install cantona/herdr-revive --ref v0.2.0
 herdr plugin config-dir cantona.herdr-revive
 ```
 
@@ -220,6 +221,10 @@ Herdr supplies `HERDR_PLUGIN_ROOT`, `HERDR_PLUGIN_CONFIG_DIR`,
 `HERDR_PLUGIN_STATE_DIR`, `HERDR_SOCKET_PATH`, and `HERDR_BIN_PATH`.
 Explicit CLI overrides are `--config-dir`, `--state-dir`, `--socket`, and
 `--herdr-bin`; paths must be absolute. No fallback to another session occurs.
+Outside the plugin environment pass `--host herdr` (or set
+`HERDR_REVIVE_HOST=herdr`), or name the paths with `--config-dir`,
+`--state-dir` or `--socket`, which imply the herdr host; the plugin's own
+actions and events already pass `--host herdr`.
 
 | Command | Behavior |
 | --- | --- |
@@ -231,7 +236,7 @@ Explicit CLI overrides are `--config-dir`, `--state-dir`, `--socket`, and
 | `list` | List retained session snapshot paths; `--file` aliases `--snapshot` on restore/preview |
 | `event` | Once-per-boot automatic restore, then configured debounced autosave |
 | `autosave [--force]` | Configured save; `--force` bypasses debounce and performs save only |
-| `timer [--interval-seconds N]` | Foreground periodic save, including a final save on SIGINT/SIGTERM/SIGHUP |
+| `timer [--interval-seconds N]` | Foreground periodic save, including a final save on SIGINT/SIGTERM/SIGHUP (not on the core host) |
 | `space save NAME [--workspace ID]` | Save a reusable workspace; injected workspace ID is the default |
 | `space preview NAME` | Show reconstruction and command policy decisions |
 | `space open NAME [--dry-run] [--no-focus]` | Open a new copy every time; `restore` is an alias for `open` |
@@ -260,6 +265,204 @@ before restore/delete. Saved-space pickers use `fzf` when available, otherwise
 a name prompt. The optional `autosave` pane runs the timer; it is not a daemon.
 The timer's explicit saves are independent of `auto_save` and never initiate
 automatic restore. Event autosave uses leading-edge debounce, not a trailing queue.
+
+## Herdr desktop app
+
+The same binary runs against the desktop app's terminals (herdr-core, `hc`)
+with `--host core`, or `HERDR_REVIVE_HOST=core` in its environment. Capture,
+policy, snapshots, the journal and recovery are the code the TUI plugin runs;
+only the host and the triggers differ. On the app a save happens when an
+allowlisted program starts or ends in a pane (a bash hook), and a relaunch
+happens per pane, in the fresh shell core gives a lost pane, once its whole rc
+file has run and before its first prompt is drawn, as long as the rc file
+does not replace `PROMPT_COMMAND` below the herdr-revive line (see below).
+Each pane is relaunched at most once per core start; the journal records it.
+With `auto_restore` on, until a pane's own shell has recorded its relaunch (or
+that there was none to do) in the journal, automatic saves keep that pane's
+entry from the snapshot the recovery started with while core still lists its
+terminal and the pane is either not live yet or its shell is still reading
+its rc file (the shell's own process group in the foreground with rc commands
+in it). This keeps a save made while the shell is starting from replacing the
+command. An idle prompt or any program in the pane, a shell started from the
+prompt included, ends this for that pane at once, and so does a manual `save`
+for every pane.
+
+Setup (bash only):
+
+```sh
+cargo install --locked --git https://github.com/cantona/herdr-revive
+mkdir -p ~/.config/herdr-revive
+herdr-revive config > ~/.config/herdr-revive/config.toml
+herdr-revive --host core install            # dry run: names the rc file, changes nothing
+herdr-revive --host core install --write    # adds the hook line to it
+```
+
+Releases before v0.2.0 have no `--host`; install v0.2.0 or newer for the core
+host.
+
+Set `auto_save = true`, `auto_restore = true` and `allowed_programs` in the
+config, then open a new pane. The config and state directories follow
+`XDG_CONFIG_HOME` and `XDG_STATE_HOME` (`~/.config/herdr-revive`,
+`~/.local/state/herdr-revive`); `--config-dir` and `--state-dir` override
+them. If you also use the TUI plugin, give both one config by linking the
+directory: `ln -s ~/.config/herdr/plugins/config/cantona.herdr-revive
+~/.config/herdr-revive`. Link the directory, not `config.toml`: the file
+itself is opened without following symlinks and a linked one is refused.
+Snapshots stay per host. The core socket is `--socket`, else `HC_SOCKET`, else the `socket` in
+herdr-core's own config, else core's default path for `HC_SESSION`.
+
+`install --write` adds one line between `# >>> herdr-revive >>>` and
+`# <<< herdr-revive <<<` markers:
+
+```sh
+case $- in *i*) [ -n "${BASH_VERSION-}" ] && for __revive_found in "$(command -v herdr-revive 2>/dev/null)" "$HOME/.local/bin/herdr-revive" "$HOME/.cargo/bin/herdr-revive"; do [ -x "$__revive_found" ] && { eval "$(exec "$__revive_found" --host core init bash 2>/dev/null)"; break; }; done; unset __revive_found ;; esac
+```
+
+On macOS's stock bash 3.2 any DEBUG trap, this hook's included, leaves
+`PIPESTATUS` holding the trap's status, so `${PIPESTATUS[*]}` read after a
+pipeline shows `0`; bash 4 and later restore it. On Linux it goes into
+`~/.bashrc`, which core's interactive bash reads. Where core starts a login
+bash (by default on macOS; anywhere when herdr-core's `shell` has `-l`), it goes
+into the first of `~/.bash_profile`, `~/.bash_login` and `~/.profile` that
+exists, else a new `~/.bash_profile`; on Linux a login file that already
+sources `~/.bashrc` keeps it in `~/.bashrc`. A block left in another of
+these files (core's `shell` changed since) is reported by `status` and
+removed by `install --write` or `--remove`. A symlinked rc file is edited at
+its target and keeps its permissions; a hard-linked one is rewritten in
+place, so every link sees the block. A file that does not end in a newline
+gets one before the block, so the marker starts its own line; removing the
+block leaves that newline. Before the first change the file is
+copied once to `<file>.revive-backup` beside it (for a symlink, `<file>` is
+the target); there is no backup when the file was missing or empty. Every
+mode refuses an rc file with an unmatched marker, and a change to one owned
+by another user is refused.
+Without `--write` or `--remove` nothing changes; the output's `up_to_date`
+says whether the block is current, and `--write` replaces an outdated block
+in place. `install --remove` takes the block out.
+
+`init bash` prints the hook when `auto_save` is on and, when `auto_restore`
+is on and this pane has a saved command to relaunch, a one-time
+`PROMPT_COMMAND` entry that runs that command at the first prompt: after the
+rc lines below the marker block (`PATH` changes, nvm, conda), and with job
+control on, so the command leads its own process group. An rc line below the
+marker block that replaces `PROMPT_COMMAND` instead of extending it (for
+example `PROMPT_COMMAND='history -a'`) removes that entry: the command does
+not run, the journal still records it as applied, and, when `auto_save` is
+on, the hook prints a dim notice naming the command when the first prompt
+starts. It acts only in a
+pane's own shell (`HC_TERMINAL_ID` set, and its parent the shell core started
+there), and it never breaks a shell: it always exits 0, prints nothing when it
+fails before the hook is built (no `HC_TERMINAL_ID`, an unreadable config) or
+when its parent is not the pane's shell, and still prints the hook when core
+cannot be reached or the relaunch fails. `REVIVE_AUTO=0` in a pane's
+environment skips its relaunch, with a dim notice when there was something to
+relaunch. When another operation holds the session lock for longer than
+`timeout_ms` + `settle_ms` (at most 60 s), the relaunch is skipped with a dim
+notice naming `herdr-revive --host core restore --rehydrate`. Pending
+recovery evidence skips the relaunch of every app pane, with a dim notice
+naming `recovery acknowledge`, until it is acknowledged. `REVIVE_DEBUG=1`
+prints the reason for a failure or for a candidate's skipped relaunch on
+stderr, which the installed line discards (drop its `2>/dev/null` to see it).
+
+The hook registers with bash-preexec when it is loaded, and otherwise chains
+any existing `DEBUG` trap (which still sees the command's `$?` and `$_`, and
+whose return status is passed on, so `extdebug` command skipping still works)
+and adds `__revive_precmd` at the end of `PROMPT_COMMAND`, so the entries
+before it still see the command's `PIPESTATUS` and `$_`; its entry is
+`${__revive_precmd_run:-:} && :`, so the entries after it still see `$?`
+without a failure tripping `set -e` or the ERR trap, and a child bash that
+inherits an exported `PROMPT_COMMAND` runs `:` there. When another file
+runs the rc file (`~/.profile` running `~/.bashrc`), the trap goes in at
+the first prompt, because bash hides an existing `DEBUG` trap from a sourced
+file; a later line that replaces `PROMPT_COMMAND` then leaves the hook off.
+A tool loaded after the hook that wraps the `DEBUG` trap and calls it
+without the status (starship's bash init) hides the command's status from
+the hook; the shutdown guard then has only the status the prompt hook sees.
+The trap leaves `$?` and `$_` as they were, so
+`mkdir -p build && cd "$_"` still works. Evaluating it again registers
+nothing twice. When a command names an allowlisted program,
+it runs `herdr-revive --host core autosave --force` detached after 0.5 s, so
+the shell never waits. These saves are limited to two per second (the second
+one deferred to 1.5 s); a builtin such as `cd` takes none, and a save takes
+the hint of whatever the shell runs when it fires, so a third program in
+the same second is covered by the deferred one. The next prompt after such a command saves once
+more, unless the command died of SIGHUP, SIGKILL or SIGTERM (exit status
+129, 137 or 143): at shutdown every pane's program dies that way, and that
+save would record every pane idle. With the `DEBUG` trap the status is read
+when the next command starts, before any `PROMPT_COMMAND` entry runs,
+so entries the rc file puts in front of the hook's do not hide it, and such
+a status holds off every save until the prompt (for that second and the
+next), so a `PROMPT_COMMAND` entry the hook takes for a command cannot save
+a shutdown either.
+With bash-preexec it is the status bash-preexec hands its precmd functions.
+With bash-preexec the whole command line is matched; with the `DEBUG` trap
+each simple command is matched on its own (`cd x && ssh h` is checked as
+`cd x`, then as `ssh h`). `"*"` in `allowed_programs` matches every command,
+so every command line gets the limited saves and the prompt after it one more.
+A program started inside a shell function does not trigger a save (the
+`DEBUG` trap does not run inside functions unless `set -T` is on, and
+bash-preexec sees only the function's name), nor, with bash-preexec, does one
+started through an alias, whose line is matched as typed; such a program is
+captured only by the next save from elsewhere: the timer, the dialog's Save
+button, or another pane's hook. The relaunch also runs its command from a
+function, so it reports that command to the hook itself. A job brought back
+with `fg` or `%1` saves as a start does. A shell that reads its rc file
+again (`source ~/.bashrc`, `exec bash`) relaunches nothing: the saved program
+was running in this core run, so the user has stopped it since.
+
+The dialog mod shows what `herdr-revive --host core status` reports: the last
+snapshot, which panes the next core start would relaunch, any pending
+recovery, and whether the config and rc line are in place. Its buttons run
+`save`, `restore --rehydrate` and `recovery acknowledge`. To install it from
+a clone of this repository:
+
+```sh
+git clone --depth 1 https://github.com/cantona/herdr-revive
+mkdir -p ~/.config/herdr-app/mods
+cp -r herdr-revive/mods/herdr-revive ~/.config/herdr-app/mods/
+herdr-app check ~/.config/herdr-app/mods/herdr-revive
+```
+
+and add the bindings from [keys.json](keys.json) (`ctrl-alt-r`, and `cmd-alt-r` for macOS)
+to the `global` section of `~/.config/herdr-app/keys.json`. The app runs
+`herdr-revive` by name from its own `PATH`, which may lack `~/.cargo/bin`.
+herdr-app 0.1.13 stops a command after 30 s. [RECIPE.md](RECIPE.md)
+describes the dialog in full.
+
+`status`, `save`, `preview`, `restore [--rehydrate]`, `list`, `recovery`,
+`autosave` and `timer` work on the app; a manual `restore` types each command
+into its pane through core when the pane's shell is idle. `event` only saves.
+Not on the app: named spaces, `restore --recreate`, fish and zsh. The
+optional periodic timer runs in a core terminal the app does not show, and
+stops without a final save, since a logout signals every terminal at once:
+`hc run --keep --bg --no-parent --name revive-timer -- herdr-revive --host core timer`.
+It keeps running across `hc server restart` and `hc update`. When its program
+is lost (`hc server stop`, a reboot), core keeps the terminal and its name but
+puts a shell in it and never re-runs the timer: restart it there with
+`hc send revive-timer 'herdr-revive --host core timer'`, or `hc kill
+revive-timer` and run the line above again. The hook and the dialog's Save
+button do not need the timer. The rc line looks for `herdr-revive` on the
+shell's `PATH`, then in `~/.local/bin` and `~/.cargo/bin`, because a login
+bash reads `~/.bashrc` before `~/.profile` adds those, and a core started
+from the desktop hands its shells a bare `PATH`. The timer's `hc run` still
+finds `herdr-revive` by name on core's own `PATH`.
+
+Measured on Linux (Intel Core i7-10700) with `scripts/benchmark_core.py`
+(Linux only: it reads `/proc` and runs `setsid` and GNU `time -f`) against
+the fake core from `tests/core_integration.py`, not a real `hc`; 30
+interleaved warm samples per case. The init rows time the rc line's
+`$(exec herdr-revive --host core init bash)` in a fresh interactive bash, fork
+and exec included. Raw samples, versions and commands are in
+[docs/benchmarks/linux-core-2026-11-07.json](docs/benchmarks/linux-core-2026-11-07.json).
+A save makes one core request per pane but usually reads the whole process
+table only twice, not once per pane, so 100 panes cost little more than one.
+
+| Operation | p50 | p95 |
+| --- | ---: | ---: |
+| `init bash`, no relaunch | 1.62 ms | 1.73 ms |
+| `init bash`, one relaunch | 10.27 ms | 10.76 ms |
+| `autosave --force`, 1 pane | 17.70 ms | 18.53 ms |
+| `save`, 100 panes | 22.61 ms | 23.83 ms |
 
 ## Layouts and command capture
 
@@ -293,9 +496,30 @@ macOS uses authenticated Unix-socket peer credentials and a boot UUID to identif
 server restarts, and `kqueue` for autosave shutdown signals. Restore checks shell
 children directly instead of scanning every process for each idle pane. The
 [macOS validation and performance results](docs/MACOS.md) cover Apple Silicon;
-Intel macOS is compile-checked. Protected/setuid processes (including Apple's
-`top`) may not expose the required metadata. Missing process or configured
-launcher-environment data causes capture to fail and preserves the previous snapshot.
+Intel macOS is compile-checked. A protected/setuid foreground program
+(including Apple's `top`) does not expose its arguments, working directory or
+standard streams. Its pane is saved with its shell's directory, where the
+program started, and with a command only when something proves the program runs
+without redirection: the command the bash hook saw start, when it ran with the
+shell's streams on the terminal (no redirection of a group or loop around it,
+no `exec >file`), was not a function or alias, was (with bash-preexec, whose
+line comes from history) the command about to run, is plain words naming the
+program and, where Linux reads the exact command line, equals it; or the
+program's streams could be read and all point at the terminal. A hint counts
+only until the shell runs anything else or shows its prompt, so in `a && b`, `a
+| b` or `a; f` (a function) the next program never gets `a`'s line. A `( ... )`
+subshell (also as an `if` or `while` condition) or a `coproc` runs no hook in
+the shell, so `top -h; ( top > log )` can still lend `top -h` to the second
+`top`. Nor does a pipeline whose last part is a compound command (`a | while
+...`, `a | { ...; }`): if that part ends first, `a` can be saved without its
+pipe. A later save that cannot prove it again keeps the command and directory
+proven before (`protected.json` in the state directory) while that same process
+runs there in the same core generation, never by an equal command line, which
+says nothing about a new run's redirections. Otherwise the pane is saved
+without a command, as is a pane whose program Herdr reports as an agent. A
+warning says which, and the other panes still save. A process that disappears
+mid-capture or missing configured launcher-environment data still fails the
+capture and preserves the previous snapshot.
 
 Claude, Codex, Gemini, Copilot and Cursor restoration requires an exact UUID from
 a matching native reference or explicit resume arguments. An untouched bare
@@ -329,6 +553,9 @@ herdr-revive recovery inspect
 herdr-revive recovery acknowledge ID_FROM_INSPECT
 ```
 
+Outside a Herdr plugin environment add `--host herdr`, or `--host core` for
+the desktop app (`herdr-revive --host core recovery inspect`).
+
 Acknowledgement neither retries nor rolls back. Automatic replay remains
 suppressed for an acknowledged boot; a later explicit manual restore is a new
 user request. Recovery records and reconstruction source snapshots are retained
@@ -351,11 +578,13 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
 REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/integration.py
+REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/core_integration.py
 python3 tests/real_host.py
 REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/openssh.py
 python3 scripts/verify_install.py
-python3 scripts/verify_install.py --github-ref v0.1.6
+python3 scripts/verify_install.py --github-ref v0.2.0
 python3 scripts/benchmark.py --include-cli
+python3 scripts/benchmark_core.py --output docs/benchmarks/linux-core-$(date +%F).json  # Linux only
 python3 tests/benchmark_contracts.py
 python3 scripts/benchmark_matched.py --baseline ../herdr-resurrect
 python3 scripts/dependency_notices.py

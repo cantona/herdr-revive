@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0 — 2026-11-09 (prerelease)
+
+- A pane whose foreground program is protected from inspection (setuid, such
+  as Apple's `top` or `sudo`) no longer fails the whole save. It is saved with
+  the pane's cwd and the program's full command line on Linux; on macOS, the
+  bare program name, or the line the bash hook saw the shell run when it is
+  plain words. A warning names the pane.
+- Run against the Herdr desktop app (herdr-core) with `--host core`: the
+  same capture, policy, snapshots, journal and recovery over a second host.
+  A bash hook saves when an allowlisted program starts or ends in a pane; a
+  lost pane's fresh shell relaunches its program before the first prompt,
+  journaled per pane per core start. `REVIVE_AUTO=0` in a pane's environment
+  skips its relaunch. New commands `init bash`, `install [--write|--remove]`
+  and `status`, and a dialog mod under `mods/herdr-revive` (`RECIPE.md`,
+  `keys.json` binding `ctrl-alt-r`, `cmd-alt-r` on macOS). Named spaces and `restore --recreate`
+  stay TUI-only; `event` on the app only saves.
+- Direct invocations outside the Herdr plugin environment, except `config`,
+  now need `--host herdr|core` (or `HERDR_REVIVE_HOST`); before, they assumed
+  the TUI host. The plugin manifest and scripts pass `--host herdr`, so the plugin's
+  actions and events are unchanged.
+
 ## 0.1.6 — 2026-10-15 (prerelease)
 
 - Save Claude Code panes that reopened a background session as
