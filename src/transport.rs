@@ -15,6 +15,11 @@ pub trait Host {
     fn supports_layout(&self) -> bool {
         true
     }
+    /// The command line a hook typed into `pane`, when the host has one;
+    /// capture uses it only for a foreground program it cannot inspect.
+    fn command_hint(&self, _pane: &str) -> Option<String> {
+        None
+    }
     fn api(&mut self, _method: &str, _params: Value, _result_type: &str) -> Result<Value> {
         bail!("host does not implement layout APIs")
     }

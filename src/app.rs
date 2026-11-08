@@ -177,7 +177,7 @@ pub enum InitShell {
 
 pub enum HostImpl {
     Herdr(Transport),
-    Core(CoreHost),
+    Core(Box<CoreHost>),
 }
 
 impl HostImpl {
@@ -206,6 +206,12 @@ impl Host for HostImpl {
         match self {
             Self::Herdr(host) => host.supports_layout(),
             Self::Core(host) => host.supports_layout(),
+        }
+    }
+    fn command_hint(&self, pane: &str) -> Option<String> {
+        match self {
+            Self::Herdr(host) => host.command_hint(pane),
+            Self::Core(host) => host.command_hint(pane),
         }
     }
     fn snapshot(&mut self) -> Result<LiveSnapshot> {
@@ -303,6 +309,28 @@ fn init(cli: &Cli, shell: InitShell) -> Value {
     }
 }
 
+/// Makes the hints directory (owner only) and drops the files of shells
+/// that are gone, so it does not grow with every shell ever started.
+fn prepare_hints(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let gone = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none_or(|pid| crate::platform::process(pid).is_err());
+        if gone {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
 /// Whether `pid` is herdr-core's holder (`herdr-core hold ...`), the process
 /// that starts every pane's shell.
 fn parent_is_core_holder(pid: u32) -> bool {
@@ -338,8 +366,26 @@ fn init_inner(cli: &Cli, shell: InitShell) -> Result<String> {
     }
     let binary = std::env::current_exe().context("own executable path unavailable")?;
     let binary = binary.to_str().context("non-UTF-8 executable path")?;
+    let state_dir = state_dir_for(kind, cli.state_dir.clone())?;
     let hook = if config.auto_save {
-        crate::core::hook::bash_snippet(&config, binary)
+        let hints = crate::core::hook::hints_dir(&state_dir);
+        prepare_hints(&hints)?;
+        let hints = hints.to_str().context("non-UTF-8 state directory")?;
+        // The hook's saves must use the paths this init was given, not the
+        // defaults; absolute, since the shell's cwd moves.
+        let mut paths = String::new();
+        for (flag, value) in [
+            ("--config-dir", &cli.config_dir),
+            ("--state-dir", &cli.state_dir),
+            ("--socket", &cli.socket),
+        ] {
+            if let Some(value) = value {
+                let value = std::path::absolute(value)?;
+                let value = value.to_str().context("non-UTF-8 path")?;
+                paths.push_str(&format!(" {flag} {}", crate::core::hook::quote(value)));
+            }
+        }
+        crate::core::hook::bash_snippet_with(&config, binary, hints, &paths)
     } else {
         String::new()
     };
@@ -367,16 +413,22 @@ fn init_inner(cli: &Cli, shell: InitShell) -> Result<String> {
         record["pid"].as_u64() == Some(u64::from(parent)),
         "init was not started by the pane's shell"
     );
+    // Noted on every init in a pane's shell, with or without the hook, so a
+    // later init in the same shell knows it is only a reload.
+    let reloaded = note_init(&state_dir, parent).unwrap_or_else(|error| {
+        init_debug(&error);
+        false
+    });
     if !config.auto_restore {
         return Ok(hook);
     }
     let paths = InitPaths {
-        state_dir: state_dir_for(kind, cli.state_dir.clone())?,
+        state_dir,
         session,
         socket,
         config_dir,
     };
-    match init_relaunch(core, &record, &paths, &config, parent) {
+    match init_relaunch(core, &record, &paths, &config, parent, reloaded) {
         Ok(Relaunch::Command(text)) => Ok(text + &hook),
         Ok(Relaunch::Notice(text)) => Ok(hook + text),
         Ok(Relaunch::Nothing) => Ok(hook),
@@ -416,11 +468,15 @@ fn init_relaunch(
     paths: &InitPaths,
     config: &Config,
     parent: u32,
+    reloaded: bool,
 ) -> Result<Relaunch> {
     let Some(pane) = crate::core::host::live_pane(record)? else {
         return Ok(Relaunch::Nothing);
     };
     let store = Store::new(&paths.state_dir, paths.session.clone())?;
+    if reloaded && saved_in_this_run(&store, &paths.socket, &pane.pane_id)? {
+        return Ok(Relaunch::Nothing);
+    }
     let live = crate::core::host::live_snapshot(std::slice::from_ref(record))?;
     // Most new shells have nothing to relaunch; learn that before waiting
     // for the lock, which a running save holds for seconds while the prompt
@@ -453,7 +509,7 @@ fn init_relaunch(
             Relaunch::Nothing
         });
     }
-    let mut host = HostImpl::Core(core);
+    let mut host = HostImpl::Core(Box::new(core));
     relaunch_pane(
         &mut host,
         &store,
@@ -467,9 +523,66 @@ fn init_relaunch(
     if emitted.is_empty() {
         return Ok(Relaunch::Nothing);
     }
+    // The program's own words become the hook's hint for the relaunched
+    // command, so a protected program can be proven again after a restart.
+    let words = planned
+        .saved
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == planned.entry.pane_id)
+        .and_then(|pane| match &pane.command {
+            Some(CommandSpec::Program { argv }) => Some(
+                argv.iter()
+                    .map(|word| format!("'{}'", word.replace('\'', "'\\''")))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            _ => None,
+        });
     Ok(Relaunch::Command(crate::core::hook::bash_relaunch(
         &emitted.join("\n"),
+        words.as_deref(),
     )))
+}
+
+/// Notes that `shell` ran `init`, and says whether it had already: a shell
+/// reading its rc file again (`source ~/.bashrc`, `exec bash`) keeps its
+/// pid, parent, group and start, while a new shell, even one given a reused
+/// pid, does not. Notes of shells no longer running are removed.
+fn note_init(state_dir: &Path, shell: u32) -> Result<bool> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = state_dir.join("shells");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
+    for entry in std::fs::read_dir(&dir)?.flatten() {
+        let gone = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none_or(|pid| crate::platform::process(pid).is_err());
+        if gone {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let identity = serde_json::to_string(&capture::identity_of(&platform::process(shell)?))?;
+    let path = dir.join(shell.to_string());
+    let seen = std::fs::read_to_string(&path).is_ok_and(|text| text == identity);
+    store::atomic_write(&path, identity.as_bytes())?;
+    Ok(seen)
+}
+
+/// Whether the latest save is from this core run and did not carry the pane
+/// over from the last one: then its command was running in this run, and a
+/// reloaded shell must not start it again.
+fn saved_in_this_run(store: &Store, socket: &Path, pane_id: &str) -> Result<bool> {
+    let generation = platform::generation(socket)?;
+    let last: Option<SaveTime> = maybe_json(&store.root.join("last-save.json"))?;
+    Ok(last.is_some_and(|last| {
+        last.generation == generation && !last.carried.iter().any(|id| id == pane_id)
+    }))
 }
 
 struct PlannedPane {
@@ -1027,13 +1140,34 @@ pub fn run(cli: Cli) -> Result<Value> {
         .or_else(|| std::env::var_os("HERDR_BIN_PATH").map(PathBuf::from));
     let mut host = match kind {
         HostKind::Herdr => HostImpl::Herdr(Transport::new(socket.clone(), binary, &config)),
-        HostKind::Core => HostImpl::Core(CoreHost::connect(&socket, &config, RunMode::Send)?),
+        HostKind::Core => HostImpl::Core(Box::new(CoreHost::connect(
+            &socket,
+            &config,
+            RunMode::Send,
+        )?)),
     };
     if let HostImpl::Core(core) = &mut host
         && force_save
         && !hook_shell_is_current(core)?
     {
         return Ok(json!({"status": "skipped", "reason": "shell replaced"}));
+    }
+    // The hint of the command the shell is running now, from the shell's
+    // hints file rather than this save's own REVIVE_COMMAND: a save that was
+    // deferred past later commands serves the latest one, and none once it
+    // ended. Checked again after capture, in case another started meanwhile.
+    if let HostImpl::Core(core) = &mut host
+        && force_save
+        && let (Ok(shell), Ok(terminal)) = (
+            std::env::var("REVIVE_SHELL_PID"),
+            std::env::var("HC_TERMINAL_ID"),
+        )
+        && let Some((seq, text)) = crate::core::hook::latest(&state_dir, &shell)
+        && !text.is_empty()
+        && let Some(pane) = core.hook_pane(&terminal)?
+    {
+        core.command_hint = Some((pane, text));
+        core.hint_seq = Some((state_dir.clone(), shell, seq));
     }
     let result = match cli.command {
         Action::Config | Action::Timer { .. } | Action::Init { .. } | Action::Install { .. } => {
@@ -1290,7 +1424,67 @@ fn agent_session_needs_capture(host: &mut impl Host, store: &Store) -> Result<bo
                 && native.agent == agent.name() && native.kind == "id" && *session_id == native.value)))
 }
 
-fn retain_autosaved_agents(snapshot: &mut Snapshot, previous: &Snapshot) -> usize {
+/// Gives an unproven protected pane the command an earlier save proved for
+/// the same process (pid, parent, group, start), and keeps that proof.
+/// protected.json: the proofs a save made, for the generation it made them in.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProvenFile {
+    generation: String,
+    panes: capture::Proven,
+}
+
+/// The proofs saved for `generation`; none from another generation or from
+/// the file's earlier format, which named no generation. Any other failure
+/// to read it fails the save rather than drop the proofs without a word.
+fn load_proven(path: &Path, generation: &str) -> Result<capture::Proven> {
+    let text = match std::fs::read(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(capture::Proven::new()),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+    };
+    if let Ok(file) = serde_json::from_slice::<ProvenFile>(&text) {
+        return Ok(if file.generation == generation {
+            file.panes
+        } else {
+            capture::Proven::new()
+        });
+    }
+    serde_json::from_slice::<capture::Proven>(&text)
+        .map(|_| capture::Proven::new())
+        .with_context(|| format!("{} is not a protected-program record", path.display()))
+}
+
+fn carry_proven(
+    snapshot: &mut Snapshot,
+    earlier: &capture::Proven,
+    unproven: &std::collections::HashMap<String, capture::Running>,
+    proven: &mut capture::Proven,
+) {
+    for pane in &mut snapshot.panes {
+        if pane.command.is_none()
+            && let Some(running) = unproven.get(&pane.pane_id)
+            && let Some(old) = earlier.get(&pane.pane_id)
+            && old.identity == running.identity
+        {
+            pane.command = Some(CommandSpec::Program {
+                argv: old.argv.clone(),
+            });
+            if let Some(cwd) = &old.cwd {
+                pane.cwd.clone_from(cwd);
+            }
+            proven.insert(pane.pane_id.clone(), old.clone());
+        }
+    }
+}
+
+/// Keeps a previously saved agent session for a pane captured without a
+/// command, when it is still the same pane in the same place. A protected
+/// program's command is carried per process by `carry_proven` instead.
+fn retain_autosaved_commands(
+    snapshot: &mut Snapshot,
+    previous: &Snapshot,
+    unproven: &std::collections::HashMap<String, capture::Running>,
+) -> usize {
     let index: std::collections::HashMap<_, _> = previous
         .panes
         .iter()
@@ -1303,7 +1497,12 @@ fn retain_autosaved_agents(snapshot: &mut Snapshot, previous: &Snapshot) -> usiz
             && old.workspace_id == pane.workspace_id
             && old.tab_id == pane.tab_id
             && old.cwd == pane.cwd
+            // A protected program's earlier command carries only through
+            // its proof for the same process (carry_proven): an equal argv
+            // says nothing about the redirections around a new run.
             && matches!(old.command, Some(CommandSpec::Agent { .. }))
+            // Capture saw a protected program there now, not the agent.
+            && !unproven.contains_key(&pane.pane_id)
         {
             pane.command.clone_from(&old.command);
             retained += 1;
@@ -1369,7 +1568,26 @@ fn save(
         store::validate_name(name)?;
     }
     let generation = platform::generation(socket)?;
-    let mut snapshot = capture::capture(host, &store.session, workspace, config)?;
+    let (mut snapshot, protected) = capture::capture(host, &store.session, workspace, config)?;
+    // Checked again now that the process table has been read: a newer command
+    // may have started in between and taken the hinted one's place. Its own
+    // save follows; this one would pair the old hint with the new process.
+    if let HostImpl::Core(core) = host
+        && let Some((state, shell, seq)) = &core.hint_seq
+        && !crate::core::hook::hint_is_current(state, shell, seq)
+    {
+        return Ok(
+            json!({"status": "skipped", "reason": "a newer command started during capture"}),
+        );
+    }
+    // A proof made for a protected process holds while that very process
+    // runs: an earlier save's proof is reused for it, nothing else. Only
+    // within one core generation: macOS gives no start time, and after a
+    // restart the same pids come round again.
+    let proven_path = store.root.join("protected.json");
+    let earlier = load_proven(&proven_path, &generation)?;
+    let mut proven = protected.proven;
+    carry_proven(&mut snapshot, &earlier, &protected.unproven, &mut proven);
     let core_recovery = automatic && config.auto_restore && matches!(host, HostImpl::Core(_));
     let previous = if automatic
         && (core_recovery || snapshot.panes.iter().any(|pane| pane.command.is_none()))
@@ -1386,7 +1604,7 @@ fn save(
             previous.session == store.session,
             "cross-session snapshot refused"
         );
-        retained_agents = retain_autosaved_agents(&mut snapshot, previous);
+        retained_agents = retain_autosaved_commands(&mut snapshot, previous, &protected.unproven);
         if core_recovery && let HostImpl::Core(core) = host {
             let last: Option<SaveTime> = maybe_json(&store.root.join("last-save.json"))?;
             let handled = boot(store, &generation)?
@@ -1429,6 +1647,13 @@ fn save(
     }
     let carried_panes = carried.len();
     if name.is_none() {
+        store::atomic_json(
+            &proven_path,
+            &ProvenFile {
+                generation: generation.clone(),
+                panes: proven,
+            },
+        )?;
         store::atomic_json(
             &store.root.join("last-save.json"),
             &SaveTime {
@@ -1744,6 +1969,124 @@ fn import_space(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn one_pane(command: Option<CommandSpec>) -> Snapshot {
+        Snapshot {
+            tool: crate::model::TOOL.into(),
+            schema: 1,
+            session: "s".into(),
+            created_ms: 1,
+            scope: Scope::Session,
+            panes: vec![SavedPane {
+                workspace_id: "w1".into(),
+                tab_id: "w1:t1".into(),
+                pane_id: "w1:p1".into(),
+                cwd: "/tmp".into(),
+                command,
+            }],
+            layout: Vec::new(),
+            focused_workspace_id: None,
+        }
+    }
+
+    #[test]
+    fn an_unproven_protected_pane_keeps_only_its_own_earlier_command() {
+        let argv = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let running = |identity: [u64; 4]| {
+            std::collections::HashMap::from([("w1:p1".to_string(), capture::Running { identity })])
+        };
+        let program = |items: &[&str]| Some(CommandSpec::Program { argv: argv(items) });
+
+        // Linux: not even the same exact argv carries from the snapshot; a
+        // rerun of it may have a redirection its argv does not show.
+        let dd = ["sudo", "dd", "if=img", "of=/dev/sdb"];
+        let previous = one_pane(program(&dd));
+        let mut now = one_pane(None);
+        assert_eq!(
+            retain_autosaved_commands(&mut now, &previous, &running([7, 1, 7, 9])),
+            0
+        );
+
+        // An agent saved there earlier is not carried over a protected
+        // program running there now.
+        let agent = Some(CommandSpec::Agent {
+            executable: "claude".into(),
+            agent: crate::model::AgentKind::Claude,
+            session_id: "3f2b8c1e-0000-4000-8000-000000000000".into(),
+            session_mode: crate::model::AgentSessionMode::Resume,
+            claude_config_dir: None,
+            claude_home: None,
+            null_stdio: [false; 3],
+        });
+        let mut now = one_pane(None);
+        assert_eq!(
+            retain_autosaved_commands(&mut now, &one_pane(agent.clone()), &running([7, 1, 7, 9])),
+            0
+        );
+        let mut now = one_pane(None);
+        assert_eq!(
+            retain_autosaved_commands(&mut now, &one_pane(agent), &Default::default()),
+            1
+        );
+
+        // Nor does a command by name (macOS); a proof does, but only for
+        // the process it was made for.
+        let top = ["top", "-o", "cpu"];
+        let mut now = one_pane(None);
+        let named = running([7, 1, 7, 0]);
+        assert_eq!(
+            retain_autosaved_commands(&mut now, &one_pane(program(&top)), &named),
+            0
+        );
+        let earlier = capture::Proven::from([(
+            "w1:p1".to_string(),
+            capture::ProvenCommand {
+                identity: [7, 1, 7, 0],
+                argv: argv(&top),
+                cwd: Some("/where/it/ran".into()),
+            },
+        )]);
+        let mut proven = capture::Proven::new();
+        carry_proven(&mut now, &earlier, &named, &mut proven);
+        assert_eq!(now.panes[0].command, program(&top));
+        // Where it ran, not where its shell is now (resumed after a `cd`).
+        assert_eq!(now.panes[0].cwd, "/where/it/ran");
+        assert_eq!(proven, earlier);
+        // The same name in a new process (pid reused or not) gets nothing.
+        let mut later = one_pane(None);
+        let mut proven = capture::Proven::new();
+        carry_proven(&mut later, &earlier, &running([8, 1, 8, 0]), &mut proven);
+        assert_eq!(later.panes[0].command, None);
+        assert!(proven.is_empty());
+    }
+
+    #[test]
+    fn proofs_carry_only_within_the_generation_that_made_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("protected.json");
+        let proven = capture::Proven::from([(
+            "w1:p1".to_string(),
+            capture::ProvenCommand {
+                identity: [7, 1, 7, 0],
+                argv: vec!["top".into()],
+                cwd: None,
+            },
+        )]);
+        assert!(load_proven(&path, "g1").unwrap().is_empty());
+        // The earlier format: the map alone.
+        std::fs::write(&path, serde_json::to_vec(&proven).unwrap()).unwrap();
+        assert!(load_proven(&path, "g1").unwrap().is_empty());
+        let file = ProvenFile {
+            generation: "g1".into(),
+            panes: proven.clone(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        assert_eq!(load_proven(&path, "g1").unwrap(), proven);
+        assert!(load_proven(&path, "g2").unwrap().is_empty());
+        // Anything else is an error, not an empty record.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(load_proven(&path, "g1").is_err());
+    }
 
     #[test]
     fn explicit_paths_imply_the_herdr_host_outside_a_plugin() {

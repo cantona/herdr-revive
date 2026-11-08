@@ -140,11 +140,7 @@ pub fn has_children(shell: &Process) -> Result<bool> {
     Ok(count > 0)
 }
 
-fn ancestry_only(id: i32) -> Result<Process> {
-    // Full BSD info is restricted to the same user. Keep other users' parent
-    // and group IDs so privileged children/pipeline members cannot disappear
-    // from safety checks. A zero start is never accepted as a capture identity:
-    // capture/idle checks must independently succeed through process().
+fn short_info(id: i32) -> Result<libc::proc_bsdshortinfo> {
     let mut info = MaybeUninit::<libc::proc_bsdshortinfo>::zeroed();
     // SAFETY: the buffer matches the flavor's POD ABI type and exact size.
     #[allow(unsafe_code)]
@@ -171,12 +167,41 @@ fn ancestry_only(id: i32) -> Result<Process> {
         info.pbsi_pid == id as u32,
         "process ancestry identity mismatch"
     );
+    Ok(info)
+}
+
+fn ancestry_only(id: i32) -> Result<Process> {
+    // Full BSD info is restricted to the same user. Keep other users' parent
+    // and group IDs so privileged children/pipeline members cannot disappear
+    // from safety checks. A zero start is never accepted as a capture identity:
+    // capture/idle checks must independently succeed through process().
+    let info = short_info(id)?;
     Ok(Process {
         pid: info.pbsi_pid,
         parent: info.pbsi_ppid,
         group: info.pbsi_pgid,
         start: 0,
     })
+}
+
+/// A setuid process such as Apple's `top` hides its arguments and executable
+/// from an unprivileged reader, but the short BSD info still carries its
+/// command name.
+pub fn protected_argv(expected: &Process) -> Result<(Vec<String>, bool)> {
+    let info = short_info(pid(expected.pid)?)?;
+    ensure!(
+        info.pbsi_ppid == expected.parent && info.pbsi_pgid == expected.group,
+        "process changed during capture"
+    );
+    let bytes: Vec<u8> = info
+        .pbsi_comm
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    let name = String::from_utf8(bytes).context("non-UTF-8 process name refused")?;
+    ensure!(!name.is_empty(), "process name unavailable");
+    Ok((vec![name], false))
 }
 
 fn c_path(bytes: &[u8]) -> Result<PathBuf> {

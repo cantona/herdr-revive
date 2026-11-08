@@ -30,6 +30,11 @@ pub struct CoreHost {
     table_reads: usize,
     listed: HashSet<String>,
     startup: HashSet<String>,
+    /// The hook's typed command line for the pane it saves from.
+    pub command_hint: Option<(String, String)>,
+    /// Where the hint's freshness is read again after capture: the state
+    /// directory, the shell's pid and the command number the hint carried.
+    pub hint_seq: Option<(std::path::PathBuf, String, String)>,
 }
 
 impl CoreHost {
@@ -44,6 +49,8 @@ impl CoreHost {
             table_reads: 0,
             listed: HashSet::new(),
             startup: HashSet::new(),
+            command_hint: None,
+            hint_seq: None,
         })
     }
 
@@ -70,6 +77,12 @@ impl CoreHost {
         self.table_reads
     }
 
+    /// The pane id of a terminal the hook reports from, if it is a shown
+    /// app pane.
+    pub fn hook_pane(&mut self, address: &str) -> Result<Option<String>> {
+        let record = self.terminal(address)?;
+        Ok(live_pane(&record)?.map(|pane| pane.pane_id))
+    }
     pub fn terminal(&mut self, address: &str) -> Result<Value> {
         validate_id(address)?;
         self.client
@@ -248,6 +261,12 @@ pub fn live_snapshot(records: &[Value]) -> Result<LiveSnapshot> {
 }
 
 impl Host for CoreHost {
+    fn command_hint(&self, pane: &str) -> Option<String> {
+        self.command_hint
+            .as_ref()
+            .filter(|(id, _)| id == pane)
+            .map(|(_, text)| text.clone())
+    }
     fn supports_layout(&self) -> bool {
         false
     }

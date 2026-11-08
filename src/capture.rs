@@ -4,19 +4,62 @@ use crate::transport::Host;
 use anyhow::{Context, Result, ensure};
 use std::path::PathBuf;
 
+/// Panes whose foreground program is protected, by pane id, split by
+/// whether this capture proved the command it saved for them.
+#[derive(Debug, Default)]
+pub struct Protected {
+    pub unproven: std::collections::HashMap<String, Running>,
+    pub proven: Proven,
+}
+
+/// Commands proven for protected processes, by pane id, kept between saves
+/// (`protected.json`): a later save that cannot prove the command again
+/// reuses it only while the very same process runs there.
+pub type Proven = std::collections::BTreeMap<String, ProvenCommand>;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvenCommand {
+    /// pid, parent, group and start of the process the proof was made for.
+    pub identity: [u64; 4],
+    pub argv: Vec<String>,
+    /// Where it ran when proven. Carried with the argv: a job resumed with
+    /// `fg` after a `cd` runs elsewhere than its shell now is.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// A protected process capture could not prove: an earlier proof carries
+/// to it only while it is the same process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Running {
+    pub identity: [u64; 4],
+}
+
+pub fn identity_of(process: &platform::Process) -> [u64; 4] {
+    [
+        u64::from(process.pid),
+        u64::from(process.parent),
+        u64::from(process.group),
+        process.start,
+    ]
+}
+
 pub fn capture(
     host: &mut impl Host,
     session: &str,
     workspace: Option<&str>,
     config: &Config,
-) -> Result<Snapshot> {
-    if let Some(snapshot) = capture_once(host, session, workspace, config)? {
-        return Ok(snapshot);
+) -> Result<(Snapshot, Protected)> {
+    if let Some(captured) = capture_once(host, session, workspace, config)? {
+        return Ok(captured);
     }
-    // A metadata wait can span unrelated pane/layout changes. Discard the
-    // pre-wait capture and take a fresh process table and complete host view.
-    capture_once(host, session, workspace, config)?
-        .context("agent metadata did not stabilize; retry capture")
+    // A metadata wait can span unrelated pane/layout changes, and a program
+    // can start between two process-table reads. Discard the first capture
+    // and take a fresh process table and complete host view.
+    capture_once(host, session, workspace, config)?.context(
+        "panes kept changing during capture (agent metadata or a starting program); retry capture",
+    )
 }
 
 fn capture_once(
@@ -24,7 +67,7 @@ fn capture_once(
     session: &str,
     workspace: Option<&str>,
     config: &Config,
-) -> Result<Option<Snapshot>> {
+) -> Result<Option<(Snapshot, Protected)>> {
     let live = host.snapshot()?;
     crate::planner::index_live(&live)?;
     if let Some(id) = workspace {
@@ -33,9 +76,10 @@ fn capture_once(
             "named workspace is not present"
         );
     }
-    let table = platform::process_table()?;
+    let mut table = platform::process_table()?;
     let mut listings = ClaudeListings::default();
     let mut panes = Vec::new();
+    let mut protected_panes = Protected::default();
     for pane in live
         .panes
         .iter()
@@ -48,13 +92,14 @@ fn capture_once(
             .context("foreground process group unavailable")?;
         let shell_process = table
             .get(&shell)
-            .context("shell is absent from process table")?;
+            .context("shell is absent from process table")?
+            .clone();
         ensure!(
             !info.foreground_processes.is_empty(),
             "foreground process information unavailable"
         );
         ensure!(
-            platform::process(shell)? == *shell_process,
+            platform::process(shell)? == shell_process,
             "shell identity changed during capture"
         );
         let mut cwd = pane.cwd.clone().context("pane cwd unavailable")?;
@@ -69,11 +114,106 @@ fn capture_once(
                 .iter()
                 .find(|p| p.pid == fg)
                 .context("foreground group leader unavailable; cannot capture unambiguously")?;
-            let identity = table
-                .get(&leader.pid)
-                .context("foreground process disappeared")?;
+            // The core host looks the foreground up in a process table it
+            // reads after this one, so a program that started in between is
+            // not here yet: read the table again (a pane running a loop of
+            // short commands would miss every time a whole capture is
+            // retried), and only then capture again.
+            if !table.contains_key(&leader.pid) {
+                table = platform::process_table()?;
+            }
+            let Some(identity) = table.get(&leader.pid) else {
+                return Ok(None);
+            };
             platform::validate_foreground_tree(&table, identity)?;
-            let (argv, process_cwd) = platform::argv_and_cwd(identity)?;
+            let (argv, process_cwd) = match platform::argv_and_cwd(identity) {
+                Ok(found) => found,
+                Err(error) if permission_denied(&error) => {
+                    // A setuid program such as Apple's top hides its identity
+                    // from an unprivileged reader. What the platform still
+                    // reveals, or the line the hook typed, stands in; for its
+                    // unreadable cwd, its shell's, which the program started
+                    // in and the shell cannot change while it runs. (The
+                    // pane's own cwd is where the terminal was created, on
+                    // herdr-core.) A detected agent is never relaunched this
+                    // way: a plain program would start a fresh session.
+                    // When even the shell's cwd cannot be read, no command is
+                    // saved: the terminal's own cwd would run it elsewhere.
+                    let shell_cwd_known = match platform::argv_and_cwd(&shell_process) {
+                        Ok((_, shell_cwd)) => {
+                            cwd = shell_cwd;
+                            true
+                        }
+                        Err(_) => false,
+                    };
+                    let agent = pane.agent.as_deref().and_then(AgentKind::from_name);
+                    let on_terminal = |pid| {
+                        platform::terminal_stdio(pid, shell).is_ok_and(|null| null == [false; 3])
+                    };
+                    let streams_on_terminal = on_terminal(identity.pid);
+                    // The typed line says nothing about a redirection the shell
+                    // itself carries (`exec >file`), so it only counts when the
+                    // shell's own streams are the terminal.
+                    let hint = host
+                        .command_hint(&pane.pane_id)
+                        .filter(|_| on_terminal(shell));
+                    let protected = platform::protected_argv(identity).ok();
+                    let command = match &protected {
+                        Some((argv, exact)) if agent.is_none() && shell_cwd_known => {
+                            protected_command(
+                                argv.clone(),
+                                *exact,
+                                hint.as_deref(),
+                                streams_on_terminal,
+                            )
+                            .map(|argv| CommandSpec::Program { argv })
+                            // An argv the snapshot would refuse fails every save.
+                            .filter(|command| command.argv().is_ok())
+                        }
+                        _ => None,
+                    };
+                    match &command {
+                        Some(CommandSpec::Program { argv }) => {
+                            protected_panes.proven.insert(
+                                pane.pane_id.clone(),
+                                ProvenCommand {
+                                    identity: identity_of(identity),
+                                    argv: argv.clone(),
+                                    cwd: Some(cwd.clone()),
+                                },
+                            );
+                        }
+                        // Unproven even when the platform revealed nothing:
+                        // a protected program runs there, not an earlier agent.
+                        _ if agent.is_none() => {
+                            protected_panes.unproven.insert(
+                                pane.pane_id.clone(),
+                                Running {
+                                    identity: identity_of(identity),
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
+                    let saved = match &command {
+                        Some(CommandSpec::Program { argv }) => format!("{argv:?}"),
+                        _ => "no command".to_string(),
+                    };
+                    eprintln!(
+                        "herdr-revive: warning: pane {}: foreground process {} is protected ({error:#}); saved with {saved} in the pane's cwd",
+                        pane.pane_id, identity.pid
+                    );
+                    panes.push(SavedPane {
+                        workspace_id: pane.workspace_id.clone(),
+                        tab_id: pane.tab_id.clone(),
+                        pane_id: pane.pane_id.clone(),
+                        cwd,
+                        command,
+                    });
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let mut null_stdio = match platform::terminal_stdio(identity.pid, shell) {
                 Ok(streams) => streams,
                 Err(_)
@@ -265,7 +405,7 @@ fn capture_once(
         focused_workspace_id: live.focused_workspace_id,
     };
     snapshot.validate()?;
-    Ok(Some(snapshot))
+    Ok(Some((snapshot, protected_panes)))
 }
 
 fn command_with_metadata_retry(
@@ -666,6 +806,132 @@ fn has_claude_option(argv: &[String], matches: impl Fn(&str) -> bool) -> bool {
     false
 }
 
+/// The argv to save for a protected program: the platform's exact argv when
+/// it has one, else the hook's typed line when it names the same program and
+/// is plain words, else the bare program name.
+/// The file name of a program path, which is what a protected process's
+/// name is compared by; macOS keeps only its first 15 characters.
+pub fn program_name(program: &str) -> Option<String> {
+    std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+}
+
+/// Whether `typed` (a file name) is the program the platform names `name`.
+/// macOS keeps 15 characters of a longer name (MAXCOMLEN 16 with its NUL).
+pub fn names_program(typed: &str, name: &str) -> bool {
+    typed == name || (name.len() == 15 && typed.starts_with(name))
+}
+
+/// The command a protected program is saved with, or None when nothing
+/// proves it runs without redirection: its streams cannot be read, so a
+/// relaunch from argv alone could drop a `< file` or `> file` the user typed.
+/// Proof is either `streams_on_terminal` (all three streams were read and
+/// are the pane's terminal) or a typed line made of plain words, which
+/// `shell_words` refuses when it holds any redirection. With an exact argv
+/// the typed words must be that argv; with only a name they must name it.
+fn protected_command(
+    argv: Vec<String>,
+    exact: bool,
+    hint: Option<&str>,
+    streams_on_terminal: bool,
+) -> Option<Vec<String>> {
+    // `command prog ...` (how a manual restore types a relaunch) runs prog
+    // itself, past any function or alias: its words are prog's.
+    let typed = hint
+        .and_then(shell_words)
+        .map(|words| match words.as_slice() {
+            [first, next, ..] if first == "command" && !next.starts_with('-') => {
+                words[1..].to_vec()
+            }
+            _ => words,
+        });
+    if exact {
+        return (streams_on_terminal || typed.as_ref() == Some(&argv)).then_some(argv);
+    }
+    if let Some(words) = typed
+        && program_name(&words[0]).is_some_and(|typed| names_program(&typed, &argv[0]))
+    {
+        return Some(words);
+    }
+    streams_on_terminal.then_some(argv)
+}
+
+/// Splits a command line the way the shell would when it holds only plain
+/// words, single or double quotes and backslash escapes. Anything the shell
+/// would expand or treat as syntax yields None: the exact argv is unknown.
+fn shell_words(text: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        other => word.push(other),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        // Bash keeps the backslash unless it escapes one of
+                        // these; `"\d"` stays two characters.
+                        '\\' => match chars.next()? {
+                            '\n' => {}
+                            c @ ('$' | '`' | '"' | '\\') => word.push(c),
+                            c => {
+                                word.push('\\');
+                                word.push(c);
+                            }
+                        },
+                        '$' | '`' => return None,
+                        other => word.push(other),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                word.push(chars.next()?);
+            }
+            ' ' | '\t' => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '*' | '?' | '[' | ']' | '{'
+            | '}' | '~' | '#' | '!' | '\n' => return None,
+            other => {
+                in_word = true;
+                word.push(other);
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    if words.is_empty() || words[0].contains('=') {
+        return None;
+    }
+    Some(words)
+}
+
+fn permission_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
 pub fn command_for(argv: &[String], native: Option<&AgentSession>) -> Result<Option<CommandSpec>> {
     validate_argv(argv)?;
     let agent = agent_launcher(argv);
@@ -741,6 +1007,177 @@ pub fn explicit_resume_id(agent: AgentKind, args: &[String]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_words_accepts_plain_words_and_quotes_only() {
+        let words = |text: &str| super::shell_words(text);
+        assert_eq!(
+            words("top -o cpu -s 5"),
+            Some(
+                vec!["top", "-o", "cpu", "-s", "5"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        assert_eq!(
+            words(r#"sudo "a b" 'c d' e\ f"#),
+            Some(
+                vec!["sudo", "a b", "c d", "e f"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            )
+        );
+        assert_eq!(words("  top  "), Some(vec!["top".to_string()]));
+        for rejected in [
+            "",
+            "   ",
+            "top | less",
+            "top; ls",
+            "top > out",
+            "ls *",
+            "echo $HOME",
+            "echo \"$HOME\"",
+            "FOO=1 top",
+            "top &",
+            "ls ~",
+            "top 'unterminated",
+            "top \\",
+        ] {
+            assert_eq!(words(rejected), None, "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn a_protected_command_needs_proof_that_it_runs_without_redirection() {
+        let argv = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let pc = super::protected_command;
+        // Exact argv: proven by the streams, or by the same typed words.
+        assert_eq!(
+            pc(argv(&["sudo", "-i"]), true, None, true),
+            Some(argv(&["sudo", "-i"]))
+        );
+        assert_eq!(
+            pc(argv(&["sudo", "-i"]), true, Some("sudo -i"), false),
+            Some(argv(&["sudo", "-i"]))
+        );
+        assert_eq!(
+            pc(argv(&["sudo", "-i"]), true, Some("sudo -s"), false),
+            None
+        );
+        assert_eq!(
+            pc(
+                argv(&["sudo", "dd", "of=/dev/sdb"]),
+                true,
+                Some("sudo dd of=/dev/sdb < disk.img"),
+                false
+            ),
+            None
+        );
+        assert_eq!(pc(argv(&["ping", "host"]), true, None, false), None);
+        // A manual restore types `command prog ...`: prog's own words.
+        assert_eq!(
+            pc(
+                argv(&["ping", "host"]),
+                true,
+                Some("command 'ping' 'host'"),
+                false
+            ),
+            Some(argv(&["ping", "host"]))
+        );
+        assert_eq!(
+            pc(
+                argv(&["top"]),
+                false,
+                Some("command 'top' '-o' 'cpu'"),
+                false
+            ),
+            Some(argv(&["top", "-o", "cpu"]))
+        );
+        assert_eq!(
+            pc(argv(&["top"]), false, Some("command -p top"), false),
+            None
+        );
+        // Name only: a matching typed line supplies the arguments.
+        assert_eq!(
+            pc(argv(&["top"]), false, Some("top -o cpu -s 5"), false),
+            Some(argv(&["top", "-o", "cpu", "-s", "5"]))
+        );
+        assert_eq!(
+            pc(argv(&["top"]), false, Some("/usr/bin/top -o cpu"), false),
+            Some(argv(&["/usr/bin/top", "-o", "cpu"]))
+        );
+        assert_eq!(
+            pc(argv(&["top"]), false, Some("htop -d 5"), true),
+            Some(argv(&["top"]))
+        );
+        assert_eq!(pc(argv(&["top"]), false, Some("htop -d 5"), false), None);
+        assert_eq!(
+            pc(argv(&["top"]), false, Some("top > top.log"), false),
+            None
+        );
+        assert_eq!(
+            pc(argv(&["top"]), false, Some("top | less"), true),
+            Some(argv(&["top"]))
+        );
+        assert_eq!(pc(argv(&["top"]), false, None, true), Some(argv(&["top"])));
+        assert_eq!(pc(argv(&["top"]), false, None, false), None);
+        assert_eq!(
+            pc(
+                argv(&["averyveryverylong"]),
+                false,
+                Some("averyveryverylongname -x"),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            pc(
+                argv(&["sixteencharsname"]),
+                false,
+                Some("sixteencharsname-plus -x"),
+                false
+            ),
+            None,
+            "macOS never reports 16 characters"
+        );
+        // macOS keeps the first 15 characters of a longer name.
+        assert_eq!(
+            pc(
+                argv(&["abcdefghijklmno"]),
+                false,
+                Some("abcdefghijklmnopqrstu -x"),
+                false
+            ),
+            Some(argv(&["abcdefghijklmnopqrstu", "-x"]))
+        );
+    }
+
+    #[test]
+    fn a_backslash_in_double_quotes_is_kept_unless_bash_would_drop_it() {
+        let words = |text: &str| super::shell_words(text).unwrap();
+        assert_eq!(words(r#"grep "\d+" f"#), ["grep", r"\d+", "f"]);
+        assert_eq!(
+            words(r#"echo "a\"b" "c\\d" "e\$f" "g\`h""#),
+            ["echo", "a\"b", r"c\d", "e$f", "g`h"]
+        );
+        assert_eq!(words(r"echo \d"), ["echo", "d"]);
+    }
+
+    #[test]
+    fn only_a_permission_error_anywhere_in_the_chain_is_a_protected_process() {
+        use std::io::{Error, ErrorKind};
+        let denied = anyhow::Error::from(Error::from(ErrorKind::PermissionDenied))
+            .context("process identity unavailable");
+        assert!(super::permission_denied(&denied));
+        assert!(!super::permission_denied(&anyhow::anyhow!(
+            "process changed during capture"
+        )));
+        assert!(!super::permission_denied(
+            &anyhow::Error::from(Error::from(ErrorKind::NotFound)).context("gone")
+        ));
+    }
+
     use super::*;
 
     #[test]
