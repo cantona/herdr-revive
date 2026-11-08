@@ -400,6 +400,23 @@ pub fn argv_and_cwd(expected: &Process) -> Result<(Vec<String>, String)> {
     Ok((argv, cwd))
 }
 
+/// `/proc/<pid>/cmdline` needs no ptrace access, so a setuid process whose
+/// cwd is unreadable still shows its exact arguments.
+pub fn protected_argv(expected: &Process) -> Result<(Vec<String>, bool)> {
+    ensure!(
+        process(expected.pid)? == *expected,
+        "process changed during capture"
+    );
+    let bytes = crate::store::read_bytes(Path::new(&format!("/proc/{}/cmdline", expected.pid)))?;
+    // Checked again after the read, as argv_and_cwd does: the pid may have
+    // been reused in between, and this argv is later executed.
+    ensure!(
+        process(expected.pid)? == *expected,
+        "PID reused during capture"
+    );
+    Ok((decode_argv(&bytes)?, true))
+}
+
 pub fn environment(expected: &Process) -> Result<Vec<u8>> {
     ensure!(
         process(expected.pid)? == *expected,

@@ -1253,7 +1253,7 @@ fn capture_skips_layout_export_for_hosts_without_layout() {
         }
     }
     let mut host = IdleNoLayout(IdleBash::spawn());
-    let snapshot = capture::capture(&mut host, &"a".repeat(64), None, &config()).unwrap();
+    let (snapshot, _) = capture::capture(&mut host, &"a".repeat(64), None, &config()).unwrap();
     assert_eq!(snapshot.panes.len(), 1);
     assert!(snapshot.layout.is_empty());
 }

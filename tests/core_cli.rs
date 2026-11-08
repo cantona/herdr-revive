@@ -571,6 +571,16 @@ fn init_prints_the_hook_for_the_panes_own_shell() {
     assert!(ok, "{stderr}");
     assert_eq!(stderr, "");
     assert!(stdout.contains("__revive_preexec"), "{stdout}");
+    // The hook's saves use the paths this init was given.
+    assert!(
+        stdout.contains(&format!(
+            " --host core --config-dir '{}' --state-dir '{}' --socket '{}' autosave --force",
+            dirs.config().display(),
+            dirs.state().display(),
+            core.socket.display()
+        )),
+        "{stdout}"
+    );
     assert!(
         !stdout.contains("__revive_relaunch() {"),
         "hook-only output: {stdout}"
@@ -606,7 +616,7 @@ printf '%s|' "$PROMPT_COMMAND""#,
     );
     assert_eq!(
         String::from_utf8(shell.stdout).unwrap(),
-        "save 0.5\npc\nsave 0.5\necho pc;\n__revive_precmd|"
+        "save 0.5\npc\nsave 0.5\necho pc;\n${__revive_precmd_run:-:} && :|"
     );
 
     dirs.write_config("auto_save = false\nallowed_programs = [\"ssh\"]\n");
@@ -704,6 +714,37 @@ fn init_notes_a_skipped_relaunch_only_when_the_pane_has_a_candidate() {
 }
 
 #[test]
+fn a_shell_reading_its_rc_file_again_relaunches_nothing() {
+    let core = FakeCore::start(vec![]);
+    let dirs = Dirs::new();
+    // No hook at all (auto_save off): the shell is known by init's own note.
+    dirs.write_config(
+        "auto_save = false\nauto_restore = true\nsettle_ms = 0\nallowed_programs = [\"sleep\"]\n",
+    );
+    dirs.seed(&core.socket, &["sleep", "600"]);
+    let generation = herdr_revive::platform::generation(&core.socket).unwrap();
+    herdr_revive::store::atomic_json(
+        &dirs.store(&core.socket).root.join("last-save.json"),
+        &serde_json::json!({"generation": generation, "time_ms": 1}),
+    )
+    .unwrap();
+    // `source ~/.bashrc`: init ran once in this shell already (REVIVE_AUTO=0
+    // so that run relaunches nothing), and the latest save is from this run.
+    let (ok, stdout, stderr) = init_on_pty(
+        &dirs,
+        &core,
+        &[("REVIVE_PRELUDE", r#"REVIVE_AUTO=0 "$@" >/dev/null 2>&1"#)],
+    );
+    assert!(ok, "{stderr}");
+    assert!(!stdout.contains("__revive_relaunch() {"), "{stdout}");
+    // A new shell in the same run (a kept terminal's keep-recovery shell)
+    // still relaunches.
+    let (ok, stdout, stderr) = init_on_pty(&dirs, &core, &[]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("__revive_relaunch() {"), "{stdout}");
+}
+
+#[test]
 fn init_defers_the_relaunch_command_to_the_first_prompt() {
     let core = FakeCore::start(vec![]);
     let dirs = Dirs::new();
@@ -721,7 +762,14 @@ fn init_defers_the_relaunch_command_to_the_first_prompt() {
     );
     assert!(
         relaunch.starts_with(
-            "__revive_relaunch() {\n  __revive_relaunch() { return; }\n  unset __revive_relaunch_cmd\n"
+            "__revive_relaunch() {\n  __revive_relaunch() { return; }\n  # The relaunched program is a real command, though PROMPT_COMMAND runs it.\n  unset __revive_relaunch_cmd\n"
+        ),
+        "{stdout}"
+    );
+    // The hook's hint is the program's own words, which a save can parse.
+    assert!(
+        relaunch.contains(
+            "|| __revive_relaunching=1 __revive_preexec ''\\''sleep'\\'' '\\''600'\\'''\n"
         ),
         "{stdout}"
     );
@@ -731,13 +779,15 @@ fn init_defers_the_relaunch_command_to_the_first_prompt() {
     );
     assert!(
         relaunch.ends_with(concat!(
-            "  *) PROMPT_COMMAND=\"__revive_relaunch${PROMPT_COMMAND:+\n$PROMPT_COMMAND}\" ;;\nesac\n",
+            "  *) PROMPT_COMMAND=\"${PROMPT_COMMAND:+$PROMPT_COMMAND\n}\"'${__revive_relaunch_run:-:} && :' ;;\nesac\n",
             r#"__revive_relaunch_cmd=' cd -- '\''/tmp'\'' && command '\''sleep'\'' '\''600'\'''"#,
             "\n"
         )),
         "{stdout}"
     );
-    assert!(!stdout.contains("set -m"), "{stdout}");
+    // The relaunch runs in the user's shell; only the hook's saves use
+    // `set -m`, inside their own subshell.
+    assert!(!relaunch.contains("set -m"), "{stdout}");
     let order = Command::new("bash")
         .arg("-c")
         .arg("PROMPT_COMMAND='echo pc'\neval \"$1\"\nprintf '%s|' \"$PROMPT_COMMAND\"")
@@ -747,7 +797,7 @@ fn init_defers_the_relaunch_command_to_the_first_prompt() {
         .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&order.stdout),
-        "__revive_relaunch\necho pc\n__revive_precmd|",
+        "echo pc\n${__revive_relaunch_run:-:} && :\n${__revive_precmd_run:-:} && :|",
         "{order:?}"
     );
     let syntax = Command::new("bash")
