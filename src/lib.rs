@@ -1,5 +1,6 @@
 pub mod app;
 pub mod capture;
+pub mod core;
 pub mod layout;
 pub mod model;
 pub mod planner;
