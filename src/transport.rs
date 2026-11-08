@@ -11,6 +11,10 @@ pub trait Host {
     fn process_info(&mut self, pane: &str) -> Result<ProcessInfo>;
     fn pane(&mut self, pane: &str) -> Result<LivePane>;
     fn run(&mut self, pane: &str, text: &str) -> Result<()>;
+    /// Whether `api("layout.export", ...)` works; capture skips layout otherwise.
+    fn supports_layout(&self) -> bool {
+        true
+    }
     fn api(&mut self, _method: &str, _params: Value, _result_type: &str) -> Result<Value> {
         bail!("host does not implement layout APIs")
     }

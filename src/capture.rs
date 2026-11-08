@@ -247,7 +247,11 @@ fn capture_once(
         });
     }
     panes.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
-    let layout = crate::layout::capture(host, &live, workspace)?;
+    let layout = if host.supports_layout() {
+        crate::layout::capture(host, &live, workspace)?
+    } else {
+        Vec::new()
+    };
     let snapshot = Snapshot {
         tool: TOOL.into(),
         schema: SCHEMA,
