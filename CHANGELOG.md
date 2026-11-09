@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.1 — 2026-11-09 (prerelease)
+
+- `herdr-revive install` sets up the Herdr desktop app in one step: it
+  writes the dialog mod (`main.js`, `mod.json`, built into the binary) to
+  `~/.config/herdr-app/mods/herdr-revive` (or under `HERDR_APP_HOME` or
+  `XDG_CONFIG_HOME`), adds `ctrl-alt-r` and `cmd-alt-r` to the `global`
+  section of `keys.json`, and
+  adds the rc hook. It prints a plan (`create`, `update`, `unchanged`,
+  `skip` with a reason) and asks first; `--yes` applies without asking,
+  `--dry-run` only prints. A key bound to another action, in `global` or
+  in a `terminal` or `layout:<name>` section and however it is spelled, is
+  left as it is, key order is kept, and a missing `keys.json` is never
+  created (it is the app's whole keymap). A `keys.json` that is invalid or
+  cannot be written skips the keys and the rest still applies. An rc or mod
+  file owned by another user or with a leftover backup stops the plan
+  before anything is written, and running as root with a user's HOME is
+  refused. `herdr-revive uninstall` removes what `install` added, plus the
+  editor files the app writes into the mod folder, and nothing else. Both
+  imply `--host core`.
+- Bare `install` used to print the rc dry run as JSON; it now prints the
+  plan and, without a terminal or `--yes`, exits 2 without changing
+  anything. `install --write` and `install --remove` still apply, as
+  `install --yes` and `uninstall --yes`, and print the plan as text instead
+  of JSON. The dialog's Setup hint now reads `herdr-revive install`.
+
 ## 0.2.0 — 2026-11-09 (prerelease)
 
 - A pane whose foreground program is protected from inspection (setuid, such
