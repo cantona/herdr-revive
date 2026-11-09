@@ -12,7 +12,7 @@ const FIND = 'for f in "$(command -v herdr-revive 2>/dev/null)" "$HOME/.local/bi
 const NOT_FOUND = "cannot run herdr-revive";
 const revive = (args, options) => exec("sh", ["-c", FIND, "herdr-revive", "--host", "core", ...args], options);
 const INSTALL = "cargo install --locked --git https://github.com/cantona/herdr-revive";
-const RC_INSTALL = "herdr-revive --host core install --write";
+const RC_INSTALL = "herdr-revive install";
 const DECISION = {
   candidate: "will relaunch",
   no_command: "nothing to relaunch",

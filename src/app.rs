@@ -84,12 +84,26 @@ pub enum Action {
         #[arg(value_enum)]
         shell: InitShell,
     },
-    /// Show, add or remove the rc line that loads the hook (herdr-core host).
+    /// Install the dialog mod, its key bindings and the shell hook (herdr-core host).
     Install {
-        #[arg(long, conflicts_with = "remove")]
-        write: bool,
+        /// Apply without asking.
+        #[arg(long, alias = "write", conflicts_with = "dry_run")]
+        yes: bool,
+        /// Print the plan and change nothing.
         #[arg(long)]
+        dry_run: bool,
+        /// Same as `uninstall --yes`, as in 0.2.0.
+        #[arg(long, hide = true, conflicts_with = "yes")]
         remove: bool,
+    },
+    /// Remove what `install` added (herdr-core host).
+    Uninstall {
+        /// Apply without asking.
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
+        /// Print the plan and change nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// One read-only JSON document: latest snapshot, relaunch plan, recovery, setup.
     Status,
@@ -152,19 +166,24 @@ impl HostKind {
         if let Some(kind) = explicit {
             return Ok(kind);
         }
+        if let Some(kind) = Self::from_env()? {
+            return Ok(kind);
+        }
+        ensure!(
+            explicit_paths || std::env::var_os("HERDR_PLUGIN_STATE_DIR").is_some(),
+            "--host herdr|core is required outside a Herdr plugin environment"
+        );
+        Ok(Self::Herdr)
+    }
+
+    fn from_env() -> Result<Option<Self>> {
         match std::env::var("HERDR_REVIVE_HOST") {
             Ok(value) => match value.as_str() {
-                "herdr" => Ok(Self::Herdr),
-                "core" => Ok(Self::Core),
+                "herdr" => Ok(Some(Self::Herdr)),
+                "core" => Ok(Some(Self::Core)),
                 _ => bail!("HERDR_REVIVE_HOST must be herdr or core"),
             },
-            Err(std::env::VarError::NotPresent) => {
-                ensure!(
-                    explicit_paths || std::env::var_os("HERDR_PLUGIN_STATE_DIR").is_some(),
-                    "--host herdr|core is required outside a Herdr plugin environment"
-                );
-                Ok(Self::Herdr)
-            }
+            Err(std::env::VarError::NotPresent) => Ok(None),
             Err(_) => bail!("HERDR_REVIVE_HOST must be herdr or core"),
         }
     }
@@ -1043,6 +1062,44 @@ fn hook_shell_is_current(core: &mut CoreHost) -> Result<bool> {
 const CORE_UNSUPPORTED: &str =
     "named spaces and layout rebuild are not supported by the herdr-core host";
 
+/// `install` and `uninstall` imply the core host and talk to the terminal,
+/// so `main` runs them through `core::setup` instead of `run`.
+pub fn setup_request(
+    cli: &Cli,
+) -> Result<Option<(crate::core::setup::Direction, crate::core::setup::Confirm)>> {
+    use crate::core::setup::{Confirm, Direction};
+    let confirm = |yes: bool, dry_run: bool| match (yes, dry_run) {
+        (_, true) => Confirm::DryRun,
+        (true, false) => Confirm::Yes,
+        (false, false) => Confirm::Ask,
+    };
+    let (name, request) = match cli.command {
+        Action::Install {
+            yes,
+            dry_run,
+            remove: false,
+        } => ("install", (Direction::Install, confirm(yes, dry_run))),
+        Action::Install {
+            dry_run,
+            remove: true,
+            ..
+        } => ("install", (Direction::Uninstall, confirm(true, dry_run))),
+        Action::Uninstall { yes, dry_run } => {
+            ("uninstall", (Direction::Uninstall, confirm(yes, dry_run)))
+        }
+        _ => return Ok(None),
+    };
+    let kind = match cli.host {
+        Some(kind) => kind,
+        None => HostKind::from_env()?.unwrap_or(HostKind::Core),
+    };
+    ensure!(
+        kind == HostKind::Core,
+        "{name} is only for the herdr-core host"
+    );
+    Ok(Some(request))
+}
+
 pub fn run(cli: Cli) -> Result<Value> {
     if matches!(cli.command, Action::Timer { .. }) {
         return crate::timer::run(cli);
@@ -1053,14 +1110,13 @@ pub fn run(cli: Cli) -> Result<Value> {
     if let Action::Init { shell } = cli.command {
         return Ok(init(&cli, shell));
     }
-    let kind = HostKind::resolve(cli.host, cli.explicit_paths())?;
-    if let Action::Install { write, remove } = cli.command {
-        ensure!(
-            kind == HostKind::Core,
-            "install is only for the herdr-core host"
-        );
-        return crate::core::install::run(&crate::core::paths::home_dir()?, write, remove);
+    if matches!(
+        cli.command,
+        Action::Install { .. } | Action::Uninstall { .. }
+    ) {
+        bail!("install and uninstall print a plan and ask; run them through setup_request");
     }
+    let kind = HostKind::resolve(cli.host, cli.explicit_paths())?;
     if kind == HostKind::Core
         && matches!(
             cli.command,
@@ -1170,7 +1226,11 @@ pub fn run(cli: Cli) -> Result<Value> {
         core.hint_seq = Some((state_dir.clone(), shell, seq));
     }
     let result = match cli.command {
-        Action::Config | Action::Timer { .. } | Action::Init { .. } | Action::Install { .. } => {
+        Action::Config
+        | Action::Timer { .. }
+        | Action::Init { .. }
+        | Action::Install { .. }
+        | Action::Uninstall { .. } => {
             unreachable!()
         }
         Action::Restore {

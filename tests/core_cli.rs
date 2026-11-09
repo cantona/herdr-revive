@@ -247,20 +247,20 @@ fn the_environment_overrides_the_plugin_default() {
 
 #[test]
 fn install_refuses_the_herdr_host() {
-    let explicit = revive()
-        .arg("--host")
-        .arg("herdr")
-        .arg("install")
-        .output()
-        .unwrap();
-    let implied = revive()
-        .env("HERDR_PLUGIN_STATE_DIR", "/tmp/x")
-        .arg("install")
-        .output()
-        .unwrap();
-    for output in [explicit, implied] {
+    for (env, args) in [
+        (None, &["--host", "herdr", "install", "--yes"][..]),
+        (None, &["--host", "herdr", "uninstall", "--yes"]),
+        (Some("herdr"), &["install", "--yes"]),
+        (Some("herdr"), &["install", "--remove"]),
+    ] {
+        let mut command = revive();
+        if let Some(host) = env {
+            command.env("HERDR_REVIVE_HOST", host);
+        }
+        let output = command.args(args).output().unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(!output.status.success());
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
         assert!(
             stderr.contains("install is only for the herdr-core host"),
             "{stderr}"
@@ -991,53 +991,150 @@ fn a_core_hook_save_waits_for_the_session_lock() {
     assert_eq!(store.list("snapshots").unwrap().len(), 1);
 }
 
+fn setup(home: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let output = revive().env("HOME", home).args(args).output().unwrap();
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+fn planned_rc(plan: &str) -> std::path::PathBuf {
+    let line = plan
+        .lines()
+        .find_map(|line| line.split_once("shell hook in "))
+        .unwrap()
+        .1;
+    std::path::PathBuf::from(line.split("; ").next().unwrap())
+}
+
 #[test]
-fn install_prints_the_rc_line_and_writes_only_on_request() {
+fn install_without_a_terminal_prints_the_plan_and_needs_yes() {
     let home = tempfile::tempdir_in("/tmp").unwrap();
-    let (ok, value, stderr) = run(revive()
-        .env("HOME", home.path())
-        .args(["--host", "core", "install"]));
-    assert!(ok, "{stderr}");
-    assert_eq!(value["status"], "dry_run");
-    assert!(value["rc_line"].as_str().unwrap().contains("init bash"));
+    for args in [&["install"][..], &["--host", "core", "uninstall"]] {
+        let (code, stdout, stderr) = setup(home.path(), args);
+        assert_eq!(
+            code,
+            Some(if args[0] == "install" { 2 } else { 0 }),
+            "{args:?}"
+        );
+        assert!(stdout.starts_with("herdr-revive "), "{stdout}");
+        if code == Some(2) {
+            assert!(stdout.contains("create     shell hook in "), "{stdout}");
+            assert_eq!(stderr, "not a terminal: pass --yes to apply\n");
+        } else {
+            assert!(stdout.ends_with("nothing to change\n"), "{stdout}");
+        }
+    }
+    let (code, stdout, _) = setup(home.path(), &["install", "--dry-run"]);
+    assert_eq!(code, Some(0));
+    assert!(!stdout.contains("Apply?"), "{stdout}");
     assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
-    let (ok, value, _) = run(revive()
-        .env("HOME", home.path())
-        .args(["--host", "core", "install", "--write"]));
-    assert!(ok);
-    assert_eq!(value["status"], "written");
-    let rc = std::path::PathBuf::from(value["target"].as_str().unwrap());
+}
+
+#[test]
+fn install_write_and_remove_still_apply_without_asking() {
+    let home = tempfile::tempdir_in("/tmp").unwrap();
+    let app = home.path().join(".config/herdr-app");
+    let stock = "{\n  \"global\": {\n    \"ctrl-q\": \"app.quit\"\n  }\n}\n";
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("keys.json"), stock).unwrap();
+    let (code, stdout, stderr) = setup(home.path(), &["--host", "core", "install", "--write"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.ends_with("done\n"), "{stdout}");
+    let rc = planned_rc(&stdout);
     assert!(
-        std::fs::read_to_string(rc)
+        std::fs::read_to_string(&rc)
             .unwrap()
             .contains("# >>> herdr-revive >>>")
     );
-    let (ok, _, stderr) = run(revive().args(["--host", "herdr", "install"]));
-    assert!(!ok);
-    assert!(stderr.contains("install is only for the herdr-core host"));
+    assert!(app.join("mods/herdr-revive/main.js").is_file());
+    assert!(app.join("mods/herdr-revive/mod.json").is_file());
+    let keys: Value =
+        serde_json::from_str(&std::fs::read_to_string(app.join("keys.json")).unwrap()).unwrap();
+    assert_eq!(keys["global"]["ctrl-alt-r"], "mod.open:herdr-revive");
+    assert_eq!(keys["global"]["cmd-alt-r"], "mod.open:herdr-revive");
+
+    let (code, stdout, _) = setup(home.path(), &["install", "--yes"]);
+    assert_eq!(code, Some(0));
+    assert!(stdout.ends_with("nothing to change\n"), "{stdout}");
+    assert_eq!(stdout.matches("unchanged  ").count(), 5, "{stdout}");
+
+    let (code, stdout, _) = setup(home.path(), &["install", "--remove", "--dry-run"]);
+    assert_eq!(code, Some(0));
+    // The two mod files, the folder, both keys and the hook.
+    assert_eq!(stdout.matches("remove     ").count(), 6, "{stdout}");
+    assert!(app.join("keys.json").exists());
+
+    let (code, stdout, stderr) = setup(home.path(), &["install", "--remove"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.starts_with("herdr-revive uninstall:\n"), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(app.join("keys.json")).unwrap(),
+        stock
+    );
+    assert!(!app.join("mods/herdr-revive").exists());
+    assert!(
+        !std::fs::read_to_string(&rc)
+            .unwrap()
+            .contains("# >>> herdr-revive >>>")
+    );
+    let (code, stdout, _) = setup(home.path(), &["uninstall", "--yes"]);
+    assert_eq!(code, Some(0));
+    assert!(stdout.ends_with("nothing to change\n"), "{stdout}");
+}
+
+#[test]
+fn install_write_and_remove_change_the_hook_while_keys_json_is_broken() {
+    let home = tempfile::tempdir_in("/tmp").unwrap();
+    let app = home.path().join(".config/herdr-app");
+    let broken = "{ \"global\": { \"ctrl-q\": \"app.quit\", }, }";
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("keys.json"), broken).unwrap();
+    let (code, stdout, stderr) = setup(home.path(), &["--host", "core", "install", "--write"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains("keys.json: keys.json is not valid JSON ("),
+        "{stdout}"
+    );
+    let rc = planned_rc(&stdout);
+    assert!(
+        std::fs::read_to_string(&rc)
+            .unwrap()
+            .contains("# >>> herdr-revive >>>")
+    );
+    let (code, stdout, stderr) = setup(home.path(), &["install", "--remove"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.ends_with("done\n"), "{stdout}");
+    assert!(
+        !std::fs::read_to_string(&rc)
+            .unwrap()
+            .contains("# >>> herdr-revive >>>")
+    );
+    assert_eq!(
+        std::fs::read_to_string(app.join("keys.json")).unwrap(),
+        broken
+    );
 }
 
 #[test]
 fn install_refuses_an_rc_file_with_an_unmatched_marker() {
     let home = tempfile::tempdir_in("/tmp").unwrap();
-    let (ok, value, stderr) = run(revive()
-        .env("HOME", home.path())
-        .args(["--host", "core", "install"]));
-    assert!(ok, "{stderr}");
-    let rc = std::path::PathBuf::from(value["target"].as_str().unwrap());
+    let (code, stdout, stderr) = setup(home.path(), &["install", "--dry-run"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let rc = planned_rc(&stdout);
     let text = "export A=1\n# >>> herdr-revive >>>\nexport KEEP=1\n";
     std::fs::write(&rc, text).unwrap();
     for args in [
         &["install"][..],
         &["install", "--write"],
         &["install", "--remove"],
+        &["uninstall", "--yes"],
     ] {
-        let (ok, value, stderr) = run(revive()
-            .env("HOME", home.path())
-            .args(["--host", "core"])
-            .args(args));
-        assert!(!ok, "{args:?}");
-        assert!(value.is_null());
+        let (code, stdout, stderr) = setup(home.path(), args);
+        assert_eq!(code, Some(1), "{args:?}");
+        assert!(stdout.is_empty());
         assert!(
             stderr.contains("rc file has an unmatched herdr-revive marker at line 2"),
             "{stderr}"

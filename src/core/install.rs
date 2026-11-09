@@ -50,7 +50,7 @@ pub fn rc_file_for(home: &Path, macos: bool, login: bool) -> PathBuf {
 
 /// Refuses when `target` no longer holds `read`: an editor saved it while
 /// the block was being worked out, and writing now would drop that edit.
-fn unchanged_since(target: &Path, read: &str) -> Result<()> {
+pub(crate) fn unchanged_since(target: &Path, read: &str) -> Result<()> {
     ensure!(
         read_rc(target)? == read,
         "{} changed while install was writing it; run install again",
@@ -267,6 +267,41 @@ pub fn run(home: &Path, write: bool, remove: bool) -> Result<Value> {
     }))
 }
 
+/// Every check `run(home, write, remove)` makes before it writes, made
+/// without writing: ownership, the backup path and a copy left by a failed
+/// hard-link rewrite, for the chosen file and each file holding a stray block.
+pub fn preflight(home: &Path, write: bool, remove: bool) -> Result<()> {
+    let link = rc_file(home);
+    let target = resolve(&link)?;
+    let current = read_rc(&target)?;
+    let found = blocks(&current).with_context(|| target.display().to_string())?;
+    let wanted = if remove {
+        splice(&current, &found, None)
+    } else if write {
+        add(&current, &found)
+    } else {
+        return Ok(());
+    };
+    if wanted != current {
+        writable(&target, &current)?;
+    }
+    for link in blocks_elsewhere(home) {
+        let target = resolve(&link)?;
+        let current = read_rc(&target)?;
+        blocks(&current).with_context(|| target.display().to_string())?;
+        writable(&target, &current)?;
+    }
+    Ok(())
+}
+
+fn writable(target: &Path, current: &str) -> Result<()> {
+    writable_mode(target)?;
+    if !current.is_empty() {
+        existing_backup(&backup_path(target)?)?;
+    }
+    no_leftover_copy(target)
+}
+
 fn read_rc(target: &Path) -> Result<String> {
     match std::fs::read(target) {
         Ok(bytes) => {
@@ -300,7 +335,7 @@ pub fn inspect(home: &Path) -> Value {
         && let Some(stray) = elsewhere.first()
     {
         error = json!(format!(
-            "the hook is also in {}, but herdr-core's shell is set up to read {}: run install --write to keep only that one",
+            "the hook is also in {}, but herdr-core's shell is set up to read {}: run herdr-revive install to keep only that one",
             stray.display(),
             link.display()
         ));
@@ -339,7 +374,7 @@ fn resolve(link: &Path) -> Result<PathBuf> {
 /// The mode to give the edited file and its backup; a new rc file gets 0644.
 /// Refuses a file owned by someone else, so `sudo` with an inherited HOME
 /// cannot leave a root-owned rc file behind.
-fn writable_mode(path: &Path) -> Result<u32> {
+pub(crate) fn writable_mode(path: &Path) -> Result<u32> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let euid = nix::unistd::geteuid().as_raw();
     let meta = match std::fs::metadata(path) {
@@ -376,26 +411,29 @@ fn backup_path(target: &Path) -> Result<PathBuf> {
     Ok(target.with_file_name(name))
 }
 
+/// Whether a usable backup is already at `path`; a dangling symlink there is an error.
+fn existing_backup(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("backup path {} is a dangling symlink", path.display())
+            }
+            Err(e) => Err(e).with_context(|| format!("cannot inspect backup {}", path.display())),
+        },
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("cannot inspect backup {}", path.display())),
+    }
+}
+
 /// An existing backup holds the content from before the first edit, so it is never replaced.
 fn back_up(target: &Path, bytes: &[u8], mode: u32) -> Result<PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let path = backup_path(target)?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(&path) {
-            Ok(_) => return Ok(path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                bail!("backup path {} is a dangling symlink", path.display())
-            }
-            Err(e) => {
-                return Err(e).with_context(|| format!("cannot inspect backup {}", path.display()));
-            }
-        },
-        Ok(_) => return Ok(path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e).with_context(|| format!("cannot inspect backup {}", path.display()));
-        }
+    if existing_backup(&path)? {
+        return Ok(path);
     }
     let context = || format!("cannot write backup {}", path.display());
     let parent = path.parent().with_context(context)?;
@@ -416,7 +454,29 @@ fn back_up(target: &Path, bytes: &[u8], mode: u32) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn replace(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+fn old_copy_path(path: &Path) -> PathBuf {
+    let mut keep = path.as_os_str().to_owned();
+    keep.push(".revive-old");
+    PathBuf::from(keep)
+}
+
+/// A hard-linked file is rewritten in place with its text kept beside it;
+/// one left by a rewrite that failed holds the only full copy.
+pub(crate) fn no_leftover_copy(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata(path).is_ok_and(|meta| meta.nlink() > 1) {
+        let keep = old_copy_path(path);
+        ensure!(
+            !keep.exists(),
+            "{} exists from an earlier rewrite that failed; restore {} from it or remove it",
+            keep.display(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn replace(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let context = || format!("cannot write {}", path.display());
@@ -427,16 +487,8 @@ fn replace(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         // The text as it is now is kept beside it until the rewrite is on
         // disk: a write that fails half way (a full disk) must not leave the
         // rc file truncated with no copy of what it held.
-        let mut keep = path.as_os_str().to_owned();
-        keep.push(".revive-old");
-        let keep = PathBuf::from(keep);
-        // One left by a rewrite that failed holds the only full copy.
-        ensure!(
-            !keep.exists(),
-            "{} exists from an earlier rewrite that failed; restore {} from it or remove it",
-            keep.display(),
-            path.display()
-        );
+        let keep = old_copy_path(path);
+        no_leftover_copy(path)?;
         let mut copy = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
