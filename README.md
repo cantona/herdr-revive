@@ -112,7 +112,7 @@ On macOS, install Xcode Command Line Tools (`xcode-select --install`) for the li
 Install the tagged source release; Herdr previews the manifest and builds it:
 
 ```sh
-herdr plugin install cantona/herdr-revive --ref v0.2.0
+herdr plugin install cantona/herdr-revive --ref v0.2.1
 herdr plugin config-dir cantona.herdr-revive
 ```
 
@@ -291,14 +291,50 @@ Setup (bash only):
 
 ```sh
 cargo install --locked --git https://github.com/cantona/herdr-revive
+herdr-revive install             # shows the plan, asks y/N
+```
+
+`install` prints its plan, one line per item with `create`, `update`,
+`unchanged` or `skip` (followed by the reason), and asks before it changes
+anything. The
+items are the dialog mod (`main.js` and `mod.json`, built into the binary)
+in `~/.config/herdr-app/mods/herdr-revive`, the `ctrl-alt-r` and
+`cmd-alt-r` bindings in the `global` section of `~/.config/herdr-app/keys.json`
+(`HERDR_APP_HOME`, or `herdr-app` under `XDG_CONFIG_HOME`, replaces
+`~/.config/herdr-app`), and the rc hook described
+below. `--dry-run` prints the plan only; `--yes` applies it without asking.
+The prompt goes to stderr and is shown only when stdin and stderr are both
+terminals. Otherwise, without `--yes`, it prints the plan, then
+`not a terminal: pass --yes to apply`, and exits 2. `uninstall` takes the same
+flags and removes the two mod files, the `gpui-kit.d.ts` and `jsconfig.json`
+the app writes into the folder, the folder unless something else is left in
+it (the plan names what), the bindings that still open this mod, and the rc
+hook. `keys.json` is the
+app's whole keymap, so `install` never creates it: open the app once first.
+Once `install` has edited `keys.json`, herdr-app no longer adds new default
+shortcuts to it on upgrade, and the file is rewritten with 2-space
+indentation. A key already bound to another action, in
+`global` or in a `terminal` or `layout:<name>` section that takes precedence,
+is never changed, whatever its spelling (`alt-ctrl-r`, `option`, `super`);
+other keys keep their order. A `keys.json` that is not valid JSON or cannot
+be written skips the two keys and leaves the file alone; the mod and the rc
+hook still go ahead. An rc file or mod file that `install` could not write
+(owned by another user, or a backup left from a failed edit) stops the plan
+before anything is written, and running it as root with
+your HOME (`sudo`) is refused. A linked mod directory or mod file is left
+alone. Running `install` again finishes an install that stopped part way. 0.2.0's
+`install --write` and `install --remove` still work as `install --yes` and
+`uninstall --yes`.
+
+For the config:
+
+```sh
 mkdir -p ~/.config/herdr-revive
 herdr-revive config > ~/.config/herdr-revive/config.toml
-herdr-revive --host core install            # dry run: names the rc file, changes nothing
-herdr-revive --host core install --write    # adds the hook line to it
 ```
 
 Releases before v0.2.0 have no `--host`; install v0.2.0 or newer for the core
-host.
+host, and v0.2.1 or newer for `install` to set up the mod and keys.
 
 Set `auto_save = true`, `auto_restore = true` and `allowed_programs` in the
 config, then open a new pane. The config and state directories follow
@@ -311,7 +347,7 @@ itself is opened without following symlinks and a linked one is refused.
 Snapshots stay per host. The core socket is `--socket`, else `HC_SOCKET`, else the `socket` in
 herdr-core's own config, else core's default path for `HC_SESSION`.
 
-`install --write` adds one line between `# >>> herdr-revive >>>` and
+The rc hook is one line between `# >>> herdr-revive >>>` and
 `# <<< herdr-revive <<<` markers:
 
 ```sh
@@ -327,7 +363,7 @@ into the first of `~/.bash_profile`, `~/.bash_login` and `~/.profile` that
 exists, else a new `~/.bash_profile`; on Linux a login file that already
 sources `~/.bashrc` keeps it in `~/.bashrc`. A block left in another of
 these files (core's `shell` changed since) is reported by `status` and
-removed by `install --write` or `--remove`. A symlinked rc file is edited at
+removed by `install` or `uninstall`. A symlinked rc file is edited at
 its target and keeps its permissions; a hard-linked one is rewritten in
 place, so every link sees the block. A file that does not end in a newline
 gets one before the block, so the marker starts its own line; removing the
@@ -336,9 +372,8 @@ copied once to `<file>.revive-backup` beside it (for a symlink, `<file>` is
 the target); there is no backup when the file was missing or empty. Every
 mode refuses an rc file with an unmatched marker, and a change to one owned
 by another user is refused.
-Without `--write` or `--remove` nothing changes; the output's `up_to_date`
-says whether the block is current, and `--write` replaces an outdated block
-in place. `install --remove` takes the block out.
+`install` replaces an outdated block in place (its plan line says
+`update`); `uninstall` takes the block out.
 
 `init bash` prints the hook when `auto_save` is on and, when `auto_restore`
 is on and this pane has a saved command to relaunch, a one-time
@@ -413,18 +448,9 @@ was running in this core run, so the user has stopped it since.
 The dialog mod shows what `herdr-revive --host core status` reports: the last
 snapshot, which panes the next core start would relaunch, any pending
 recovery, and whether the config and rc line are in place. Its buttons run
-`save`, `restore --rehydrate` and `recovery acknowledge`. To install it from
-a clone of this repository:
-
-```sh
-git clone --depth 1 https://github.com/cantona/herdr-revive
-mkdir -p ~/.config/herdr-app/mods
-cp -r herdr-revive/mods/herdr-revive ~/.config/herdr-app/mods/
-herdr-app check ~/.config/herdr-app/mods/herdr-revive
-```
-
-and add the bindings from [keys.json](keys.json) (`ctrl-alt-r`, and `cmd-alt-r` for macOS)
-to the `global` section of `~/.config/herdr-app/keys.json`. The app runs
+`save`, `restore --rehydrate` and `recovery acknowledge`. `herdr-revive
+install` puts it in `~/.config/herdr-app/mods/herdr-revive` and binds it to
+`ctrl-alt-r` (`cmd-alt-r` on macOS), as in [keys.json](keys.json). The app runs
 `herdr-revive` by name from its own `PATH`, which may lack `~/.cargo/bin`.
 herdr-app 0.1.13 stops a command after 30 s. [RECIPE.md](RECIPE.md)
 describes the dialog in full.
@@ -582,7 +608,7 @@ REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/core_integration.
 python3 tests/real_host.py
 REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/openssh.py
 python3 scripts/verify_install.py
-python3 scripts/verify_install.py --github-ref v0.2.0
+python3 scripts/verify_install.py --github-ref v0.2.1
 python3 scripts/benchmark.py --include-cli
 python3 scripts/benchmark_core.py --output docs/benchmarks/linux-core-$(date +%F).json  # Linux only
 python3 tests/benchmark_contracts.py

@@ -7,6 +7,21 @@ buttons save now, relaunch idle panes now, or read the facts again.
 
 ![Herdr Revive](preview.png)
 
+## Install
+
+```sh
+cargo install --locked --git https://github.com/cantona/herdr-revive
+herdr-revive install             # shows the plan, asks y/N
+```
+
+`install` writes `main.js` and `mod.json` (built into the binary) to
+`~/.config/herdr-app/mods/herdr-revive`, adds the two bindings to
+`~/.config/herdr-app/keys.json` and the shell hook to the rc file.
+`herdr-revive uninstall` reverses it. `keys.json` must exist already (open
+the app once); once it is edited, herdr-app stops adding new default
+shortcuts to it, and install rewrites its formatting with 2-space
+indentation.
+
 ## What you see
 
 One dialog, 560px wide, drawn on the theme's `popover` color with 18px
@@ -29,7 +44,7 @@ padding and 8px corners. Text is 13px.
     is acknowledged." and an "Acknowledge without retry" button.
   - **Setup:** "Shell hook in <rc file>" with "installed" (`done`),
     "missing" or "update needed" (`blocked`, followed by the command
-    `herdr-revive --host core install --write`), or "unreadable" (`blocked`,
+    `herdr-revive install`), or "unreadable" (`blocked`,
     followed by the error text). Then "Config <dir>/config.toml" with
     "present" (`done`) or "defaults" (`muted`); "auto_save / auto_restore"
     with "on" / "off" each; "allowed_programs" as a comma list or "none".
@@ -82,7 +97,9 @@ holds the session lock; or one of these error bodies:
   `{ "place": "none", "title": "herdr-revive", "overlay": { "kind": "dialog", "width": 560 } }`.
   No layout block; `mod.open` shows it as a dialog.
 - `keys.json`: `{ "global": { "ctrl-alt-r": "mod.open:herdr-revive", "cmd-alt-r": "mod.open:herdr-revive" } }`,
-  merged into the person's own `keys.json`.
+  merged into the person's own `keys.json` by `herdr-revive install`, which
+  never changes a key bound to another action, in `global` or in a
+  `terminal` or `layout:<name>` section that takes precedence.
 - `mods/herdr-revive/main.js`, one `View`:
   - `herdr-revive --host core status` in `cx.spawn`, run through
     `exec("sh", ...)` so it is found as described under Watch out, and
