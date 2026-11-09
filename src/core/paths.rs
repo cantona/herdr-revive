@@ -119,6 +119,33 @@ pub fn home_dir() -> Result<PathBuf> {
     Ok(home)
 }
 
+/// The Herdr desktop app's home: `HERDR_APP_HOME`, else `herdr-app` under
+/// `XDG_CONFIG_HOME` or `~/.config`. The docs name only `~/.config`, but the
+/// app reads `XDG_CONFIG_HOME` too; herdr-triggers resolves it the same way.
+/// A relative `XDG_CONFIG_HOME` is ignored, as the XDG spec says.
+pub fn app_home(home: &Path) -> Result<PathBuf> {
+    app_home_from(
+        non_empty("HERDR_APP_HOME"),
+        non_empty("XDG_CONFIG_HOME"),
+        home,
+    )
+}
+
+fn app_home_from(
+    app_home: Option<PathBuf>,
+    config_home: Option<PathBuf>,
+    home: &Path,
+) -> Result<PathBuf> {
+    if let Some(path) = app_home {
+        ensure!(path.is_absolute(), "HERDR_APP_HOME must be absolute");
+        return Ok(path);
+    }
+    Ok(config_home
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+        .join("herdr-app"))
+}
+
 pub fn config_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
     tool_dir(explicit, "XDG_CONFIG_HOME", ".config")
 }
@@ -199,6 +226,26 @@ mod tests {
 
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn app_home_ignores_a_relative_config_home_but_not_a_relative_app_home() {
+        let home = Path::new("/home/u");
+        let at = |app: Option<&str>, config: Option<&str>| {
+            app_home_from(app.map(PathBuf::from), config.map(PathBuf::from), home)
+        };
+        assert_eq!(
+            at(None, None).unwrap(),
+            PathBuf::from("/home/u/.config/herdr-app")
+        );
+        assert_eq!(
+            at(None, Some("cfg")).unwrap(),
+            PathBuf::from("/home/u/.config/herdr-app")
+        );
+        assert_eq!(at(None, Some("/x")).unwrap(), PathBuf::from("/x/herdr-app"));
+        assert_eq!(at(Some("/a"), Some("/x")).unwrap(), PathBuf::from("/a"));
+        let error = at(Some("a"), None).unwrap_err();
+        assert_eq!(error.to_string(), "HERDR_APP_HOME must be absolute");
+    }
 
     fn inputs() -> SocketInputs {
         SocketInputs {

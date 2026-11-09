@@ -1,15 +1,34 @@
 use clap::Parser;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, IsTerminal, Write};
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("herdr-revive: {error:#}");
-        std::process::exit(1);
+    match run() {
+        Ok(0) => {}
+        Ok(code) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("herdr-revive: {error:#}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> anyhow::Result<()> {
-    let value = herdr_revive::app::run(herdr_revive::app::Cli::parse())?;
+fn run() -> anyhow::Result<i32> {
+    let cli = herdr_revive::app::Cli::parse();
+    if let Some((direction, confirm)) = herdr_revive::app::setup_request(&cli)? {
+        let paths = herdr_revive::core::setup::Paths::from_env()?;
+        let stdin = std::io::stdin();
+        let tty = stdin.is_terminal() && std::io::stderr().is_terminal();
+        return herdr_revive::core::setup::run(
+            direction,
+            confirm,
+            &paths,
+            &mut stdin.lock(),
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+            tty,
+        );
+    }
+    let value = herdr_revive::app::run(cli)?;
     let mut output = BufWriter::new(std::io::stdout().lock());
     if let Some(text) = value
         .get("config")
@@ -22,5 +41,5 @@ fn run() -> anyhow::Result<()> {
         writeln!(output)?;
     }
     output.flush()?;
-    Ok(())
+    Ok(0)
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PTY tests for the herdr-core host: a real interactive bash reads an rc file
-written by `install --write`, and a fake core answers revive's JSON-RPC calls.
+written by `install --yes`, and a fake core answers revive's JSON-RPC calls.
 Nothing touches the real home, config, state or herdr-core socket."""
 import json
 import os
@@ -367,10 +367,12 @@ class Fixture:
             f"{key} = {json.dumps(value)}" for key, value in dict(
                 auto_save=auto_save, auto_restore=auto_restore, allowed_programs=["sleep"],
                 timeout_ms=2000, settle_ms=0, debounce_ms=0).items()) + "\n")
-        installed = self.run("install", "--write")
-        if installed["status"] != "written":
-            raise AssertionError(f"install --write: {installed}")
-        self.rc = Path(installed["target"])
+        installed = subprocess.run([str(BINARY), "install", "--yes"], env=self.env(),
+                                   capture_output=True, text=True, timeout=15)
+        if installed.returncode or not installed.stdout.endswith("done\n"):
+            raise AssertionError(f"install --yes: {installed.stdout}{installed.stderr}")
+        hook = next(line for line in installed.stdout.splitlines() if "shell hook in " in line)
+        self.rc = Path(hook.split("shell hook in ", 1)[1].split("; ")[0]).resolve()
         # PS1 goes first so the prompt is the fixture's only once the rc file,
         # including any relaunch it evaluates, has finished.
         self.rc.write_text("PS1='FIXTURE_READY> '\n" + self.rc.read_text())
