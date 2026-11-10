@@ -410,6 +410,18 @@ fn capture_once(
     Ok(Some((snapshot, protected_panes)))
 }
 
+/// The agent session metadata of a pane did not arrive in time. `save`
+/// says that the previous snapshot is kept; migrate, which keeps none, does
+/// not.
+#[derive(Debug)]
+pub struct MetadataTimeout(pub String);
+
+impl std::fmt::Display for MetadataTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pane {}: agent session metadata did not arrive", self.0)
+    }
+}
+
 fn command_with_metadata_retry(
     host: &mut impl Host,
     pane: &LivePane,
@@ -463,7 +475,7 @@ fn command_with_metadata_retry(
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return initial
-                .context("agent session metadata did not arrive; previous snapshot retained")
+                .with_context(|| MetadataTimeout(pane.pane_id.clone()))
                 .map(|command| (command, false, false));
         }
         std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
