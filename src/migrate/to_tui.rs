@@ -3,11 +3,12 @@
 //! creates in the TUI. The app's layout document and terminals are only read.
 
 use super::external;
-use super::ledger::{self, Entry, Ledger, Same, TuiCreated, TuiSource, same_workspace};
+use super::ledger::{self, Entry, Ledger, Same, TuiCreated, TuiSource, WorkspaceRecord, live_of};
 use super::tree;
 use super::tui::{self, Target};
 use super::{
     Applied, PlanLine, Report, Request, Side, Status, TuiSession, drive, earlier_run, missing_note,
+    uncaptured_reason,
 };
 use crate::core::hook::quote;
 use crate::core::host::{CoreHost, RunMode, address_of};
@@ -217,6 +218,8 @@ pub struct Context<'a> {
     pub home: &'a str,
     /// `platform::existing_folder`, which tests replace.
     pub existing_folder: fn(&str) -> Option<&str>,
+    /// The spaces whose terminals the core capture could not read, with why.
+    pub uncaptured: &'a BTreeMap<String, String>,
 }
 
 /// What the app calls an unnamed space when it cannot see its terminals:
@@ -234,7 +237,7 @@ fn folder_name(folder: &str, home: &str) -> String {
 
 /// The TUI session a copy goes into, as a plan reports it and compares
 /// earlier copies with.
-pub fn tui_session(session: &str, live: &LiveSnapshot) -> TuiSession {
+pub fn tui_session(session: &str, live: &LiveSnapshot, spaces: &[DocSpace]) -> TuiSession {
     TuiSession {
         session: session.into(),
         workspaces: live
@@ -248,7 +251,17 @@ pub fn tui_session(session: &str, live: &LiveSnapshot) -> TuiSession {
             .iter()
             .map(|workspace| (workspace.workspace_id.clone(), workspace.label.clone()))
             .collect(),
+        spaces: Some(present_spaces(spaces)),
     }
+}
+
+/// The app spaces of this machine (not another machine's).
+fn present_spaces(spaces: &[DocSpace]) -> Vec<String> {
+    spaces
+        .iter()
+        .filter(|space| space.machine().is_none())
+        .map(|space| space.id.clone())
+        .collect()
 }
 
 pub fn plan(
@@ -271,7 +284,38 @@ pub fn plan(
         .iter()
         .filter(|space| space.machine().is_none())
         .filter(|space| only.is_empty() || only.contains(&space.id));
-    let tui_session = tui_session(context.session, context.live);
+    let tui_session = tui_session(context.session, context.live, spaces);
+    let lives = tui_session.lives();
+    // Only the records of spaces the app still has count: a closed one
+    // neither matches nor makes a label ambiguous.
+    let present = present_spaces(spaces);
+    let listed = |space: &str| present.iter().any(|id| id == space);
+    let tui_entries = ledger.tui_entries(context.session);
+    let copy_pool: Vec<(&str, ledger::Seen)> = tui_entries
+        .iter()
+        .filter(|recorded| listed(&recorded.source.space))
+        .map(|recorded| {
+            (
+                recorded.created.workspace_id.as_str(),
+                recorded.created.seen(),
+            )
+        })
+        .collect();
+    let app_records: Vec<_> = ledger
+        .app_entries(None, context.session)
+        .into_iter()
+        .chain(ledger.app_partials(None, context.session))
+        .collect();
+    let origin_pool: Vec<(&str, ledger::Seen)> = app_records
+        .iter()
+        .filter(|recorded| recorded.created.space.as_deref().is_some_and(listed))
+        .map(|recorded| {
+            (
+                recorded.source.workspace_id.as_str(),
+                recorded.source.seen(),
+            )
+        })
+        .collect();
     let mut items = Vec::new();
     for (position, space) in selected.enumerate() {
         // The TUI shows any label it is given, an empty one included.
@@ -282,6 +326,19 @@ pub fn plan(
         } else {
             folder_name(&space.folder, context.home)
         };
+        let source = TuiSource {
+            space: space.id.clone(),
+        };
+        // A space whose terminals the core capture could not read is shown,
+        // not copied.
+        if let Some(reason) = context.uncaptured.get(&space.id) {
+            items.push(Item {
+                line: PlanLine::new(None, &space.id, label).skip(&uncaptured_reason(reason)),
+                source,
+                snapshot: None,
+            });
+            continue;
+        }
         let built = build_snapshot(space, position + 1, &label, context)?;
         let mut line = PlanLine::new(None, &space.id, label);
         line.tabs = built.tabs;
@@ -290,23 +347,21 @@ pub fn plan(
         line.denied = built.denied;
         line.mod_blocks = built.mod_blocks;
         let missing = built.missing;
-        let source = TuiSource {
-            space: space.id.clone(),
-        };
-        let live = |workspace_id: &str| {
-            tui_session
-                .workspaces
-                .iter()
-                .any(|id| id == workspace_id)
-                .then(|| tui_session.seen(workspace_id))
-        };
-        // Only a copy into this TUI session makes the space done here.
+        // Only a copy into this TUI session makes the space done here. Its
+        // workspace is found by the id it was copied to, or, after the TUI
+        // renumbered its workspaces, by a terminal or a label only it has
+        // (`ledger::live_of`).
         let copy = ledger
             .copied_to_tui(&source, context.session)
             .and_then(|recorded| {
-                let live = live(&recorded.created.workspace_id)?;
-                let same = same_workspace(recorded.created.seen(), live);
-                Some((recorded.created.workspace_id.clone(), same, recorded.at))
+                let record = WorkspaceRecord {
+                    value: (),
+                    id: &recorded.created.workspace_id,
+                    seen: recorded.created.seen(),
+                    at: recorded.at,
+                };
+                live_of(&record, &copy_pool, &lives)
+                    .map(|(workspace, same, was)| (workspace, same, recorded.at, was))
             });
         // A space `--to app` made from a workspace of this session that is
         // still there would come back as a second copy of it.
@@ -316,34 +371,46 @@ pub fn plan(
                 recorded.source.machine.is_none() && recorded.source.session == context.session
             })
             .and_then(|recorded| {
-                let live = live(&recorded.source.workspace_id)?;
-                let same = same_workspace(recorded.source.seen(), live);
-                Some((recorded.source.workspace_id.clone(), same, recorded.at))
+                let record = WorkspaceRecord {
+                    value: (),
+                    id: &recorded.source.workspace_id,
+                    seen: recorded.source.seen(),
+                    at: recorded.at,
+                };
+                live_of(&record, &origin_pool, &lives)
+                    .map(|(workspace, same, was)| (workspace, same, recorded.at, was))
             });
         if built.snapshot.is_none() {
             line = line.skip("only mod panes");
-        } else if let Some((workspace, same, at)) = copy.as_ref().filter(|copy| copy.1 != Same::No)
+        } else if let Some((workspace, same, at, was)) =
+            copy.as_ref().filter(|copy| copy.1 != Same::No)
         {
             line.status = Status::Unchanged;
             line.copy = Some(workspace.clone());
-            if *same == Same::Label {
-                line.notes.push(label_copy_note(*at, workspace));
+            match was {
+                Some(was) => line.notes.push(moved_copy_note(*same, was, workspace)),
+                None if *same == Same::Label => line.notes.push(label_copy_note(*at, workspace)),
+                None => {}
             }
-        } else if let Some((workspace, same, at)) =
+        } else if let Some((workspace, same, at, was)) =
             origin.as_ref().filter(|origin| origin.1 != Same::No)
         {
             line = line.skip(&format!("copy of TUI workspace {workspace}"));
-            if *same == Same::Label {
-                line.notes.push(label_origin_note(Some(*at), workspace));
+            match was {
+                Some(was) => line.notes.push(moved_origin_note(*same, was, workspace)),
+                None if *same == Same::Label => {
+                    line.notes.push(label_origin_note(Some(*at), workspace));
+                }
+                None => {}
             }
         } else {
             // herdr gives a closed workspace's id to a new one after its
-            // server restarts; one with neither a recorded terminal nor the
-            // recorded label is named, not trusted.
-            if let Some((workspace, _, at)) = &copy {
+            // server restarts; a record under a live id that is neither that
+            // workspace nor matched elsewhere is named, not trusted.
+            if let Some((workspace, _, at, _)) = &copy {
                 line.notes.push(copy_note(*at, workspace));
             }
-            if let Some((workspace, _, at)) = &origin {
+            if let Some((workspace, _, at, _)) = &origin {
                 line.notes.push(origin_note(Some(*at), workspace));
             }
         }
@@ -392,6 +459,28 @@ pub fn origin_note(at: Option<u64>, workspace: &str) -> String {
         "{} made this space from TUI workspace {workspace}; {workspace} may now be another \
          workspace that took its id: if it is the same, this copies it back",
         earlier_run(at)
+    )
+}
+
+/// The earlier copy of this space is a live workspace with another id than
+/// the one it was copied to (`ledger::moved_note`).
+pub fn moved_copy_note(same: Same, was: &str, workspace: &str) -> String {
+    ledger::moved_note(
+        same,
+        was,
+        &format!("in TUI workspace {workspace}"),
+        &format!("{workspace} is another workspace, close or rename it to copy this space"),
+    )
+}
+
+/// This space was made from a TUI workspace that now has another id
+/// (`ledger::moved_note`).
+pub fn moved_origin_note(same: Same, was: &str, workspace: &str) -> String {
+    ledger::moved_note(
+        same,
+        was,
+        &format!("from TUI workspace {workspace}"),
+        &format!("{workspace} is another workspace, close or rename it to copy this space"),
     )
 }
 
@@ -469,10 +558,10 @@ pub fn apply(
                     .or(asked),
             ),
             Err(error) => {
-                eprintln!(
-                    "warning: the TUI did not list workspace {workspace} after the copy \
-                     ({error:#}); the next plan knows it only by its label"
-                );
+                report.warnings.push(format!(
+                    "the TUI did not list workspace {workspace} after the copy ({error:#}); \
+                     the next plan knows it only by its label"
+                ));
                 (None, asked)
             }
         };
@@ -625,14 +714,11 @@ pub fn run(
         .map(|workspace| workspace.workspace_id.clone())
         .filter(|id| request.only.is_empty() || request.only.contains(id))
         .collect();
-    let captured = super::capture_each(
-        &mut core,
-        &core_session,
-        &selected,
-        None,
-        &core_config,
-        "the terminals of app space",
-    )?;
+    let super::Captured {
+        snapshot: captured,
+        warnings: captured_warnings,
+        uncaptured,
+    } = super::capture_each(&mut core, &core_session, &selected, None, &core_config)?;
     let captured = by_address(&captured)?;
     // Display names only matter for unnamed spaces, and come from the open
     // window; without one, `herdr-app` fails at once (nothing listens on its
@@ -660,13 +746,16 @@ pub fn run(
         session: &target.session,
         home,
         existing_folder: crate::platform::existing_folder,
+        uncaptured: &uncaptured,
     };
     let items = plan(&spaces, &request.only, &context, &ledger)?;
-    let report = Report::new(
+    let mut report = Report::new(
         Side::Tui,
         None,
         items.iter().map(|item| item.line.clone()).collect(),
     );
+    report.tui_session = Some(tui_session(&target.session, &live, &spaces));
+    report.warnings = captured_warnings;
     drive(
         report,
         request.confirm,
@@ -799,21 +888,30 @@ mod tests {
         ledger: &Ledger,
         names: &BTreeMap<String, String>,
     ) -> Result<Vec<Item>> {
+        planned_live(only, &live(live_workspaces), ledger, names)
+    }
+
+    fn planned_live(
+        only: &[String],
+        live: &LiveSnapshot,
+        ledger: &Ledger,
+        names: &BTreeMap<String, String>,
+    ) -> Result<Vec<Item>> {
         let config = Config {
             allowed_programs: vec!["claude".into()],
             ..Config::default()
         };
         let captured = captured();
-        let live = live(live_workspaces);
         let session = "b".repeat(64);
         let context = Context {
             captured: &captured,
             config: &config,
             names,
-            live: &live,
+            live,
             session: &session,
             home: "/home/u",
             existing_folder: fake_folder,
+            uncaptured: &BTreeMap::new(),
         };
         plan(&read_spaces(&doc())?, only, &context, ledger)
     }
@@ -1076,6 +1174,7 @@ mod tests {
             session: &"b".repeat(64),
             home: "/home/u",
             existing_folder: fake_folder,
+            uncaptured: &BTreeMap::new(),
         };
         build_snapshot(space, 1, "x", &context).unwrap()
     }
@@ -1125,6 +1224,7 @@ mod tests {
             session: &session,
             home: "/home/u",
             existing_folder: fake_folder,
+            uncaptured: &BTreeMap::new(),
         };
         let items = plan(&spaces, &[], &context, &ledger).unwrap();
         assert_eq!(
@@ -1174,11 +1274,48 @@ mod tests {
             session: &session,
             home: "/home/u",
             existing_folder: fake_folder,
+            uncaptured: &BTreeMap::new(),
         };
         let items = plan(&read_spaces(&doc()).unwrap(), &[], &context, &ledger).unwrap();
         let line = &items[0].line;
         assert_eq!((line.agents, line.denied), (0, 1));
         assert_eq!(line.notes, Vec::<String>::new(), "no live-agents note");
+    }
+
+    #[test]
+    fn a_space_the_core_capture_could_not_read_is_a_skip_line() {
+        let root = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(root.path()).unwrap();
+        let captured = captured();
+        let live = live(&[]);
+        let session = "b".repeat(64);
+        let config = Config::default();
+        let uncaptured = BTreeMap::from([("s1".to_string(), "terminal t1 is gone".to_string())]);
+        let context = Context {
+            captured: &captured,
+            config: &config,
+            names: &BTreeMap::new(),
+            live: &live,
+            session: &session,
+            home: "/home/u",
+            existing_folder: fake_folder,
+            uncaptured: &uncaptured,
+        };
+        let items = plan(&read_spaces(&doc()).unwrap(), &[], &context, &ledger).unwrap();
+        assert_eq!(
+            (
+                items[0].line.status,
+                items[0].line.reason.as_deref(),
+                items[0].line.name.as_str()
+            ),
+            (
+                Status::Skip,
+                Some("cannot capture: terminal t1 is gone"),
+                "api"
+            )
+        );
+        assert!(items[0].snapshot.is_none());
+        assert_eq!(items[1].line.source, "s2", "the other spaces are planned");
     }
 
     #[test]
@@ -1364,6 +1501,187 @@ mod tests {
         copied_from_tui(&mut ledger, "c".repeat(64), "w6");
         let items = planned(&[], &["w6"], &ledger).unwrap();
         assert_eq!(items[0].line.status, Status::Create, "another TUI session");
+    }
+
+    #[test]
+    fn a_space_another_machine_copied_here_is_not_copied_back() {
+        // Another machine's `--to app --machine` made s1 here from this TUI's
+        // w5, and recorded it here through `migrate --record`.
+        let root = tempfile::tempdir().unwrap();
+        let source = ledger::AppSource {
+            machine: Some("this".into()),
+            session: "b".repeat(64),
+            workspace_id: "w5".into(),
+            terminal_ids: Some(vec!["term_w5".into()]),
+            label: Some("api".into()),
+        };
+        let created = ledger::AppCreated {
+            space: Some("this/s1".into()),
+            terminals: vec!["this/t1".into()],
+            unknown: false,
+        };
+        let entry = crate::migrate::remote::entry_for_machine("this", &source, &created, 3);
+        let args = crate::migrate::remote::record_args(&entry, false).unwrap();
+        crate::migrate::remote::record_here(&args[2], false, root.path()).unwrap();
+        let ledger = Ledger::open(root.path()).unwrap();
+        let items = planned(&[], &["w5"], &ledger).unwrap();
+        assert_eq!(
+            (items[0].line.status, items[0].line.reason.as_deref()),
+            (Status::Skip, Some("copy of TUI workspace w5"))
+        );
+    }
+
+    /// Live workspaces `(id, label)` on terminals `new_<id>`.
+    fn relabelled(workspaces: &[(&str, &str)]) -> LiveSnapshot {
+        let ids: Vec<&str> = workspaces.iter().map(|(id, _)| *id).collect();
+        let mut live = live(&ids);
+        for (workspace, (_, label)) in live.workspaces.iter_mut().zip(workspaces) {
+            workspace.label = label.to_string();
+        }
+        for pane in &mut live.panes {
+            pane.terminal_id = format!("new_{}", pane.workspace_id);
+        }
+        live
+    }
+
+    #[test]
+    fn spaces_are_matched_after_the_tui_renumbers_its_workspaces() {
+        let made_from = |ledger: &mut Ledger, space: &str, workspace: &str, label: &str, at| {
+            ledger
+                .record(Entry::ToApp {
+                    source: ledger::AppSource {
+                        machine: None,
+                        session: "b".repeat(64),
+                        workspace_id: workspace.into(),
+                        terminal_ids: Some(vec![format!("old_{label}")]),
+                        label: Some(label.into()),
+                    },
+                    created: ledger::AppCreated {
+                        space: Some(space.into()),
+                        terminals: vec![],
+                        unknown: false,
+                    },
+                    at,
+                })
+                .unwrap();
+        };
+        let copied_to = |ledger: &mut Ledger, space: &str, workspace: &str, label: &str, at| {
+            ledger
+                .record(Entry::ToTui {
+                    source: TuiSource {
+                        space: space.into(),
+                    },
+                    created: TuiCreated {
+                        session: "b".repeat(64),
+                        workspace_id: workspace.into(),
+                        terminal_ids: Some(vec![format!("old_{label}")]),
+                        label: Some(label.into()),
+                    },
+                    at,
+                })
+                .unwrap();
+        };
+        let only = ["s1".to_string()];
+        let names = BTreeMap::new();
+        // w2 "api" and w3 "web" were numbered w1 and w2 again by a rebuild,
+        // with new terminals.
+        let renumbered = relabelled(&[("w1", "[1] api"), ("w2", "[2] web")]);
+        for (s1, s9, live, was) in [
+            (("w2", "api"), ("w3", "web"), "w1", "w2"),
+            (("w3", "web"), ("w2", "api"), "w2", "w3"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut ledger = Ledger::open(root.path()).unwrap();
+            made_from(&mut ledger, "s1", s1.0, s1.1, 1);
+            made_from(&mut ledger, "s9", s9.0, s9.1, 2);
+            let items = planned_live(&only, &renumbered, &ledger, &names).unwrap();
+            let line = &items[0].line;
+            assert_eq!(line.status, Status::Skip, "{s1:?}");
+            let reason = format!("copy of TUI workspace {live}");
+            assert_eq!(line.reason.as_deref(), Some(reason.as_str()));
+            assert_eq!(line.notes, [moved_origin_note(Same::Label, was, live)]);
+
+            let root = tempfile::tempdir().unwrap();
+            let mut ledger = Ledger::open(root.path()).unwrap();
+            copied_to(&mut ledger, "s1", s1.0, s1.1, 1);
+            copied_to(&mut ledger, "s9", s9.0, s9.1, 2);
+            let items = planned_live(&only, &renumbered, &ledger, &names).unwrap();
+            let line = &items[0].line;
+            assert_eq!(line.status, Status::Unchanged, "{s1:?}");
+            assert_eq!(line.copy.as_deref(), Some(live));
+            assert_eq!(line.notes, [moved_copy_note(Same::Label, was, live)]);
+        }
+        // Two live workspaces are named "api": the label tells neither apart,
+        // and the record under w2, now "web", is named, not trusted.
+        let twins = relabelled(&[("w1", "[1] api"), ("w2", "[2] web"), ("w3", "[3] api")]);
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(root.path()).unwrap();
+        made_from(&mut ledger, "s1", "w2", "api", 1);
+        let items = planned_live(&only, &twins, &ledger, &names).unwrap();
+        assert_eq!(items[0].line.status, Status::Create);
+        assert_eq!(
+            items[0].line.notes,
+            [origin_note(Some(1), "w2"), live_agents_note(1)]
+        );
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(root.path()).unwrap();
+        copied_to(&mut ledger, "s1", "w2", "api", 1);
+        let items = planned_live(&only, &twins, &ledger, &names).unwrap();
+        assert_eq!(items[0].line.status, Status::Create);
+        assert_eq!(
+            items[0].line.notes,
+            [copy_note(1, "w2"), live_agents_note(1)]
+        );
+    }
+
+    #[test]
+    fn a_closed_spaces_record_does_not_make_a_label_ambiguous() {
+        // w2 "api" was copied to s0, which was closed; renumbered to w1, api
+        // was copied again to s1. Renumbered again, api is w3 with new
+        // terminals. s0 is not in the app.
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(root.path()).unwrap();
+        for (space, workspace, at) in [("s0", "w2", 1), ("s1", "w1", 2)] {
+            ledger
+                .record(Entry::ToApp {
+                    source: ledger::AppSource {
+                        machine: None,
+                        session: "b".repeat(64),
+                        workspace_id: workspace.into(),
+                        terminal_ids: Some(vec![format!("old_{workspace}")]),
+                        label: Some("api".into()),
+                    },
+                    created: ledger::AppCreated {
+                        space: Some(space.into()),
+                        terminals: vec![],
+                        unknown: false,
+                    },
+                    at,
+                })
+                .unwrap();
+        }
+        let names = BTreeMap::new();
+        for live in [
+            relabelled(&[("w3", "[1] api")]),
+            relabelled(&[("w1", "[1] web"), ("w3", "[2] api")]),
+        ] {
+            let items = planned_live(&["s1".to_string()], &live, &ledger, &names).unwrap();
+            let line = &items[0].line;
+            assert_eq!(
+                (line.status, line.reason.as_deref()),
+                (Status::Skip, Some("copy of TUI workspace w3"))
+            );
+            assert_eq!(line.notes, [moved_origin_note(Same::Label, "w1", "w3")]);
+        }
+        assert_eq!(
+            moved_origin_note(Same::Label, "w1", "w3"),
+            "matched an earlier copy from TUI workspace w3 by label (was w1): if w3 is another \
+             workspace, close or rename it to copy this space"
+        );
+        assert_eq!(
+            moved_copy_note(Same::Terminal, "w1", "w3"),
+            "matched an earlier copy in TUI workspace w3 by terminal (was w1)"
+        );
     }
 
     #[test]

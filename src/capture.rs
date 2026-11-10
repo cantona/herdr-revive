@@ -51,13 +51,46 @@ pub fn capture(
     workspace: Option<&str>,
     config: &Config,
 ) -> Result<(Snapshot, Protected)> {
-    if let Some(captured) = capture_once(host, session, workspace, config)? {
+    let mut warnings = Vec::new();
+    let captured = attempts(host, session, workspace, config, &mut warnings, true);
+    for warning in &warnings {
+        eprintln!("herdr-revive: warning: {warning}");
+    }
+    captured
+}
+
+/// `capture` for a caller that reports the warnings itself (migrate puts
+/// them in its report), without those of a discarded attempt.
+pub fn capture_noting(
+    host: &mut impl Host,
+    session: &str,
+    workspace: Option<&str>,
+    config: &Config,
+) -> Result<(Snapshot, Protected, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let (snapshot, protected) = attempts(host, session, workspace, config, &mut warnings, false)?;
+    Ok((snapshot, protected, warnings))
+}
+
+fn attempts(
+    host: &mut impl Host,
+    session: &str,
+    workspace: Option<&str>,
+    config: &Config,
+    warnings: &mut Vec<String>,
+    keep_discarded: bool,
+) -> Result<(Snapshot, Protected)> {
+    let start = warnings.len();
+    if let Some(captured) = capture_once(host, session, workspace, config, warnings)? {
         return Ok(captured);
+    }
+    if !keep_discarded {
+        warnings.truncate(start);
     }
     // A metadata wait can span unrelated pane/layout changes, and a program
     // can start between two process-table reads. Discard the first capture
     // and take a fresh process table and complete host view.
-    capture_once(host, session, workspace, config)?.context(
+    capture_once(host, session, workspace, config, warnings)?.context(
         "panes kept changing during capture (agent metadata or a starting program); retry capture",
     )
 }
@@ -67,6 +100,7 @@ fn capture_once(
     session: &str,
     workspace: Option<&str>,
     config: &Config,
+    warnings: &mut Vec<String>,
 ) -> Result<Option<(Snapshot, Protected)>> {
     let live = host.snapshot()?;
     crate::planner::index_live(&live)?;
@@ -201,10 +235,10 @@ fn capture_once(
                         Some(CommandSpec::Program { argv }) => format!("{argv:?}"),
                         _ => "no command".to_string(),
                     };
-                    eprintln!(
-                        "herdr-revive: warning: pane {}: foreground process {} is protected ({error:#}); saved with {saved} in the pane's cwd",
+                    warnings.push(format!(
+                        "pane {}: foreground process {} is protected ({error:#}); saved with {saved} in the pane's cwd",
                         pane.pane_id, identity.pid
-                    );
+                    ));
                     panes.push(SavedPane {
                         workspace_id: pane.workspace_id.clone(),
                         tab_id: pane.tab_id.clone(),
@@ -264,10 +298,10 @@ fn capture_once(
             ) {
                 Ok(resolved) => resolved,
                 Err(error) if pane.agent_session.is_some() => {
-                    eprintln!(
-                        "herdr-revive: warning: pane {}: {error:#}; using herdr's session record",
+                    warnings.push(format!(
+                        "pane {}: {error:#}; using herdr's session record",
                         pane.pane_id
-                    );
+                    ));
                     None
                 }
                 Err(error) => return Err(error),

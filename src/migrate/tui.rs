@@ -4,7 +4,7 @@
 
 use super::TuiArgs;
 use super::external;
-use super::ledger::Seen;
+use super::ledger::{AppCreated, Entry, LiveWorkspace, Seen};
 use super::tree::{self, Launch};
 use crate::model::*;
 use crate::store::{self, Store};
@@ -167,6 +167,11 @@ pub struct Export {
     pub launches: BTreeMap<String, Launch>,
     pub live_agents: Vec<String>,
     pub denied: Vec<String>,
+    /// The exported workspaces that `--to tui` on this machine made from an
+    /// app space, from this machine's ledger: the other machine's ledger
+    /// cannot know them. Exports from before this field have none.
+    #[serde(default)]
+    pub tui_copies: Vec<TuiCopy>,
     /// Each exported workspace's terminal ids (`ledger::same_workspace`).
     /// Exports from before this field have none.
     #[serde(default)]
@@ -177,9 +182,69 @@ pub struct Export {
     /// before this field have none.
     #[serde(default)]
     pub missing_folders: BTreeMap<String, String>,
+    /// The exported workspaces some machine's `--to app` copied into this
+    /// machine's app, from this machine's ledger: a copy made from a third
+    /// machine is recorded here, not there. Exports from before this field
+    /// have none.
+    #[serde(default)]
+    pub app_copies: Vec<AppCopy>,
+    /// The exported workspaces' partial copies (`--to app` copies that
+    /// stopped part way) into this machine's app, from this machine's
+    /// ledger, so a third machine skips a source whose partial copy is open.
+    /// Exports from before this field have none.
+    #[serde(default)]
+    pub partial_copies: Vec<PartialCopy>,
+    /// The selected workspaces the capture could not read, with why; the
+    /// plan shows each as a `skip` line. Exports from before this field
+    /// have none.
+    #[serde(default)]
+    pub uncaptured: Vec<Uncaptured>,
+    /// The capture's and the policy's warnings, for the report of the
+    /// machine that plans. Exports from before this field have none.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Every workspace of the session, exported or not, so a copy recorded
+    /// under an id the TUI has given another workspace since can be matched
+    /// (`ledger::match_live`). Exports from before this field have none.
+    #[serde(default)]
+    pub live_workspaces: Vec<LiveTuiWorkspace>,
+}
+
+/// A workspace of the exported TUI session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveTuiWorkspace {
+    pub workspace_id: String,
+    pub label: String,
+    pub terminal_ids: Vec<String>,
 }
 
 impl Export {
+    /// The session's live workspaces; an export from before
+    /// `live_workspaces` knows only the exported ones.
+    pub fn lives(&self) -> Vec<LiveWorkspace<'_>> {
+        if self.live_workspaces.is_empty() {
+            return self
+                .snapshot
+                .layout
+                .iter()
+                .map(|workspace| LiveWorkspace {
+                    id: &workspace.workspace_id,
+                    seen: self.seen(&workspace.workspace_id),
+                })
+                .collect();
+        }
+        self.live_workspaces
+            .iter()
+            .map(|workspace| LiveWorkspace {
+                id: &workspace.workspace_id,
+                seen: Seen {
+                    terminal_ids: Some(&workspace.terminal_ids),
+                    label: Some(&workspace.label),
+                },
+            })
+            .collect()
+    }
+
     pub fn terminal_ids_of(&self, workspace_id: &str) -> Option<&[String]> {
         self.terminal_ids.get(workspace_id).map(Vec::as_slice)
     }
@@ -213,6 +278,127 @@ pub fn terminal_ids(live: &LiveSnapshot) -> BTreeMap<String, Vec<String>> {
     ids
 }
 
+/// TUI workspace `workspace_id` of `session` is a copy of app space `space`
+/// (its id in this machine's own core document, without a machine prefix).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiCopy {
+    pub space: String,
+    pub session: String,
+    pub workspace_id: String,
+    /// The copy's terminal ids when it was made; copies from before this
+    /// field have none and cannot be told from a workspace that took the id.
+    #[serde(default)]
+    pub terminal_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub at: Option<u64>,
+}
+
+/// TUI workspace `workspace_id` of the exported session was copied into app
+/// space `space` of this machine (its bare id).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppCopy {
+    pub workspace_id: String,
+    pub space: String,
+    #[serde(default)]
+    pub terminal_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub at: u64,
+}
+
+/// The ledger's full `--to app` copies of the exported session, all of them:
+/// one recorded under an id the TUI has given another workspace since is
+/// still found (`ledger::match_live`).
+pub fn app_copies(entries: &[Entry], export: &Export) -> Vec<AppCopy> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::ToApp {
+                source,
+                created,
+                at,
+            } if source.machine.is_none() && source.session == export.session => Some(AppCopy {
+                workspace_id: source.workspace_id.clone(),
+                space: created.space.clone()?,
+                terminal_ids: source.terminal_ids.clone(),
+                label: source.label.clone(),
+                at: *at,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A TUI workspace the capture could not read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Uncaptured {
+    pub workspace_id: String,
+    pub label: String,
+    pub reason: String,
+}
+
+/// A partial copy of TUI workspace `workspace_id` of the exported session
+/// into this machine's app, with this machine's bare ids.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialCopy {
+    pub workspace_id: String,
+    pub created: AppCreated,
+    #[serde(default)]
+    pub terminal_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub at: u64,
+}
+
+/// The ledger's partial `--to app` copies of the exported session (`entries`
+/// are the ledger's `partial` list), all of them, as `app_copies`.
+pub fn partial_copies(entries: &[Entry], export: &Export) -> Vec<PartialCopy> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::ToApp {
+                source,
+                created,
+                at,
+            } if source.machine.is_none() && source.session == export.session => {
+                Some(PartialCopy {
+                    workspace_id: source.workspace_id.clone(),
+                    created: created.clone(),
+                    terminal_ids: source.terminal_ids.clone(),
+                    label: source.label.clone(),
+                    at: *at,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The ledger's `--to tui` copies into the exported session, all of them,
+/// as `app_copies`.
+pub fn tui_copies(entries: &[Entry], export: &Export) -> Vec<TuiCopy> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::ToTui {
+                source,
+                created,
+                at,
+            } if created.session == export.session => Some(TuiCopy {
+                space: source.space.clone(),
+                session: created.session.clone(),
+                workspace_id: created.workspace_id.clone(),
+                terminal_ids: created.terminal_ids.clone(),
+                label: created.label.clone(),
+                at: Some(*at),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The workspaces `--only` names, in the session's order; all of them
 /// without `--only`.
 pub fn select(live: &LiveSnapshot, only: &[String]) -> Result<Vec<String>> {
@@ -237,14 +423,30 @@ pub fn export(target: &Target, only: &[String]) -> Result<Export> {
         .snapshot()
         .context("cannot read the TUI session; is its server running?")?;
     let selected = select(&before, only)?;
-    let snapshot = super::capture_each(
+    let super::Captured {
+        snapshot,
+        mut warnings,
+        uncaptured,
+    } = super::capture_each(
         &mut host,
         &target.session,
         &selected,
         before.focused_workspace_id.clone(),
         &config,
-        "TUI workspace",
     )?;
+    let uncaptured = uncaptured
+        .into_iter()
+        .map(|(workspace_id, reason)| Uncaptured {
+            label: before
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)
+                .map(|workspace| workspace.label.clone())
+                .unwrap_or_default(),
+            workspace_id,
+            reason,
+        })
+        .collect();
     let live = host.snapshot()?;
     let home = crate::core::paths::home_dir()?;
     let home = home.to_str().context("HOME is not UTF-8")?;
@@ -271,10 +473,11 @@ pub fn export(target: &Target, only: &[String]) -> Result<Export> {
             Some(command) => match command.allowed_argv(&config) {
                 Ok(argv) => Some(argv),
                 Err(error) => {
-                    eprintln!(
-                        "warning: pane {} command is not allowed by the policy and opens a shell instead: {error:#}",
+                    warnings.push(format!(
+                        "pane {} command is not allowed by the policy and opens a shell \
+                         instead: {error:#}",
                         pane.pane_id
-                    );
+                    ));
                     denied.push(pane.pane_id.clone());
                     None
                 }
@@ -307,10 +510,21 @@ pub fn export(target: &Target, only: &[String]) -> Result<Export> {
         })
         .map(|live| live.pane_id.clone())
         .collect();
-    let terminal_ids = terminal_ids(&live)
-        .into_iter()
-        .filter(|(workspace, _)| selected.contains(workspace))
+    let mut all_terminal_ids = terminal_ids(&live);
+    let live_workspaces = live
+        .workspaces
+        .iter()
+        .map(|workspace| LiveTuiWorkspace {
+            workspace_id: workspace.workspace_id.clone(),
+            label: workspace.label.clone(),
+            terminal_ids: all_terminal_ids
+                .get(&workspace.workspace_id)
+                .cloned()
+                .unwrap_or_default(),
+        })
         .collect();
+    all_terminal_ids.retain(|workspace, _| selected.contains(workspace));
+    let terminal_ids = all_terminal_ids;
     Ok(Export {
         tool: TOOL.into(),
         schema: SCHEMA,
@@ -319,8 +533,14 @@ pub fn export(target: &Target, only: &[String]) -> Result<Export> {
         launches,
         live_agents,
         denied,
+        tui_copies: Vec::new(),
         terminal_ids,
         missing_folders,
+        app_copies: Vec::new(),
+        partial_copies: Vec::new(),
+        uncaptured,
+        warnings,
+        live_workspaces,
     })
 }
 
@@ -518,8 +738,45 @@ mod tests {
             )]),
             live_agents: vec![],
             denied: vec![],
+            tui_copies: vec![TuiCopy {
+                space: "sp1".into(),
+                session: "a".repeat(64),
+                workspace_id: "w2".into(),
+                terminal_ids: Some(vec!["term_2".into()]),
+                label: Some("api".into()),
+                at: Some(4),
+            }],
             terminal_ids: BTreeMap::from([("w1".to_string(), vec!["term_1".to_string()])]),
             missing_folders: BTreeMap::from([("w1:p2".to_string(), "/gone".to_string())]),
+            app_copies: vec![AppCopy {
+                workspace_id: "w1".into(),
+                space: "sp3".into(),
+                terminal_ids: Some(vec!["term_1".into()]),
+                label: Some("work".into()),
+                at: 5,
+            }],
+            partial_copies: vec![PartialCopy {
+                workspace_id: "w1".into(),
+                created: AppCreated {
+                    space: Some("sp6".into()),
+                    terminals: vec!["t6".into()],
+                    unknown: false,
+                },
+                terminal_ids: None,
+                label: Some("work".into()),
+                at: 6,
+            }],
+            uncaptured: vec![Uncaptured {
+                workspace_id: "w2".into(),
+                label: "[2] api".into(),
+                reason: "pane w2:p1: agent session metadata did not arrive".into(),
+            }],
+            warnings: vec!["pane w1:p2: a warning".into()],
+            live_workspaces: vec![LiveTuiWorkspace {
+                workspace_id: "w1".into(),
+                label: "[1] work".into(),
+                terminal_ids: vec!["term_1".into()],
+            }],
         };
         let value = serde_json::to_value(&export).unwrap();
         let keys: Vec<&str> = value
@@ -538,27 +795,195 @@ mod tests {
                 "launches",
                 "live_agents",
                 "denied",
+                "tui_copies",
                 "terminal_ids",
-                "missing_folders"
+                "missing_folders",
+                "app_copies",
+                "partial_copies",
+                "uncaptured",
+                "warnings",
+                "live_workspaces"
             ]
+        );
+        assert_eq!(
+            value["live_workspaces"],
+            json!([{"workspace_id": "w1", "label": "[1] work", "terminal_ids": ["term_1"]}])
         );
         assert_eq!(
             value["launches"]["w1:p1"],
             json!({"cwd": "/srv", "argv": null})
+        );
+        assert_eq!(
+            value["tui_copies"],
+            json!([{"space": "sp1", "session": "a".repeat(64), "workspace_id": "w2",
+                    "terminal_ids": ["term_2"], "label": "api", "at": 4}])
         );
         assert_eq!(value["terminal_ids"], json!({"w1": ["term_1"]}));
         assert_eq!(value["missing_folders"], json!({"w1:p2": "/gone"}));
         let back: Export = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(back, export);
         let mut older = value;
+        older.as_object_mut().unwrap().remove("tui_copies");
         older.as_object_mut().unwrap().remove("terminal_ids");
         older.as_object_mut().unwrap().remove("missing_folders");
+        older.as_object_mut().unwrap().remove("app_copies");
+        older.as_object_mut().unwrap().remove("partial_copies");
+        older.as_object_mut().unwrap().remove("uncaptured");
+        older.as_object_mut().unwrap().remove("warnings");
+        older.as_object_mut().unwrap().remove("live_workspaces");
         let back: Export = serde_json::from_value(older).unwrap();
+        assert_eq!(back.tui_copies, Vec::new());
         assert_eq!(back.missing_folders, BTreeMap::new());
+        assert_eq!(back.app_copies, Vec::new());
+        assert_eq!(back.partial_copies, Vec::new());
+        assert_eq!(back.uncaptured, Vec::new());
+        assert_eq!(back.warnings, Vec::<String>::new());
+        assert_eq!(back.live_workspaces, Vec::new());
+        let lives: Vec<&str> = back.lives().iter().map(|live| live.id).collect();
+        assert_eq!(
+            lives,
+            ["w1", "w2"],
+            "an older export knows its exported workspaces"
+        );
         assert_eq!(back.terminal_ids_of("w1"), None);
+        let copy: TuiCopy = serde_json::from_value(
+            json!({"space": "sp1", "session": "a".repeat(64), "workspace_id": "w2"}),
+        )
+        .unwrap();
+        assert_eq!((copy.terminal_ids, copy.label, copy.at), (None, None, None));
         let seen = back.seen("w1");
         assert_eq!(seen.terminal_ids, None);
         assert_eq!(seen.label, Some("[1] work"));
+    }
+
+    #[test]
+    fn tui_copies_are_all_of_the_exported_session() {
+        use crate::migrate::ledger::{AppCreated, AppSource, TuiCreated, TuiSource};
+        let export = Export {
+            tool: TOOL.into(),
+            schema: SCHEMA,
+            session: "a".repeat(64),
+            snapshot: snapshot(),
+            launches: BTreeMap::new(),
+            live_agents: vec![],
+            denied: vec![],
+            tui_copies: vec![],
+            terminal_ids: BTreeMap::new(),
+            missing_folders: BTreeMap::new(),
+            app_copies: vec![],
+            partial_copies: vec![],
+            uncaptured: vec![],
+            warnings: vec![],
+            live_workspaces: vec![],
+        };
+        let to_tui = |space: &str, session: String, workspace: &str| Entry::ToTui {
+            source: TuiSource {
+                space: space.into(),
+            },
+            created: TuiCreated {
+                session,
+                workspace_id: workspace.into(),
+                terminal_ids: Some(vec![format!("term_{workspace}")]),
+                label: Some(format!("label {workspace}")),
+            },
+            at: 1,
+        };
+        let entries = [
+            to_tui("sp1", "a".repeat(64), "w2"),
+            to_tui("sp2", "b".repeat(64), "w1"),
+            to_tui("sp3", "a".repeat(64), "w9"),
+            Entry::ToApp {
+                source: AppSource {
+                    machine: None,
+                    session: "a".repeat(64),
+                    workspace_id: "w1".into(),
+                    terminal_ids: None,
+                    label: None,
+                },
+                created: AppCreated {
+                    space: Some("sp4".into()),
+                    terminals: vec![],
+                    unknown: false,
+                },
+                at: 1,
+            },
+        ];
+        let copies = tui_copies(&entries, &export);
+        let ids: Vec<(&str, &str)> = copies
+            .iter()
+            .map(|copy| (copy.space.as_str(), copy.workspace_id.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            [("sp1", "w2"), ("sp3", "w9")],
+            "w9 is not exported, but after a renumbering it may be another live id"
+        );
+        assert_eq!(
+            copies[0],
+            TuiCopy {
+                space: "sp1".into(),
+                session: "a".repeat(64),
+                workspace_id: "w2".into(),
+                terminal_ids: Some(vec!["term_w2".into()]),
+                label: Some("label w2".into()),
+                at: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn partial_copies_are_this_machines_of_the_exported_session() {
+        use crate::migrate::ledger::AppSource;
+        let export = Export {
+            tool: TOOL.into(),
+            schema: SCHEMA,
+            session: "a".repeat(64),
+            snapshot: snapshot(),
+            launches: BTreeMap::new(),
+            live_agents: vec![],
+            denied: vec![],
+            tui_copies: vec![],
+            terminal_ids: BTreeMap::new(),
+            missing_folders: BTreeMap::new(),
+            app_copies: vec![],
+            partial_copies: vec![],
+            uncaptured: vec![],
+            warnings: vec![],
+            live_workspaces: vec![],
+        };
+        let partial = |machine: Option<&str>, session: String, workspace: &str| Entry::ToApp {
+            source: AppSource {
+                machine: machine.map(String::from),
+                session,
+                workspace_id: workspace.into(),
+                terminal_ids: None,
+                label: Some("work".into()),
+            },
+            created: AppCreated {
+                space: Some("sp1".into()),
+                terminals: vec![],
+                unknown: false,
+            },
+            at: 2,
+        };
+        let entries = [
+            partial(None, "a".repeat(64), "w1"),
+            partial(Some("mac"), "a".repeat(64), "w1"),
+            partial(None, "b".repeat(64), "w1"),
+            partial(None, "a".repeat(64), "w9"),
+        ];
+        let copies = partial_copies(&entries, &export);
+        let ids: Vec<(&str, Option<&str>, u64)> = copies
+            .iter()
+            .map(|copy| {
+                (
+                    copy.workspace_id.as_str(),
+                    copy.created.space.as_deref(),
+                    copy.at,
+                )
+            })
+            .collect();
+        assert_eq!(ids, [("w1", Some("sp1"), 2), ("w9", Some("sp1"), 2)]);
     }
 
     #[test]

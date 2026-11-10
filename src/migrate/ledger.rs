@@ -1,7 +1,8 @@
 //! `migrated.json` in the core state directory: which sources a migration
 //! copied and what it made, so a later run reports them `unchanged` while
 //! the copy exists. A copy that stopped part way is kept under `partial`
-//! until that source is copied in full, so the next plan can name it.
+//! while the app lists its space or terminals, so the next plan skips that
+//! source until it is closed.
 //!
 //! herdr numbers workspaces from a counter that restarts with its server,
 //! so a TUI workspace id can come back on a different workspace. A TUI
@@ -209,6 +210,202 @@ pub fn same_workspace(recorded: Seen, live: Seen) -> Same {
     }
 }
 
+fn app_in<'a>(
+    entries: &'a [Entry],
+    machine: Option<&str>,
+    session: &str,
+) -> Vec<Recorded<'a, AppSource, AppCreated>> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::ToApp {
+                source,
+                created,
+                at,
+            } if source.machine.as_deref() == machine && source.session == session => {
+                Some(Recorded {
+                    source,
+                    created,
+                    at: *at,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A workspace of the live TUI session.
+#[derive(Clone, Copy, Debug)]
+pub struct LiveWorkspace<'a> {
+    pub id: &'a str,
+    pub seen: Seen<'a>,
+}
+
+/// A record of a TUI workspace as it was: the id it had then, what tells
+/// it apart, when it was made, and what it records (`value`).
+#[derive(Clone, Debug)]
+pub struct WorkspaceRecord<'a, T> {
+    pub value: T,
+    pub id: &'a str,
+    pub seen: Seen<'a>,
+    pub at: u64,
+}
+
+/// A record matched to a live workspace. `was` is the id it was recorded
+/// under when the TUI has renumbered its workspaces since.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Matched<T> {
+    pub value: T,
+    pub same: Same,
+    pub at: u64,
+    pub was: Option<String>,
+}
+
+/// The plan note for a record matched to a workspace that has another id
+/// than the one it was recorded under (`was`): the TUI renumbered its
+/// workspaces, or, by the label alone, a new workspace took the label of a
+/// closed one. `copy` names the earlier copy; `if_another` says how to copy
+/// anyway when the label alone matched.
+pub fn moved_note(same: Same, was: &str, copy: &str, if_another: &str) -> String {
+    if same == Same::Terminal {
+        format!("matched an earlier copy {copy} by terminal (was {was})")
+    } else {
+        format!("matched an earlier copy {copy} by label (was {was}): if {if_another}")
+    }
+}
+
+pub fn shares_terminal(a: Seen, b: Seen) -> bool {
+    match (a.terminal_ids, b.terminal_ids) {
+        (Some(a), Some(b)) => a.iter().any(|id| b.contains(id)),
+        _ => false,
+    }
+}
+
+fn label_of(seen: Seen) -> Option<String> {
+    seen.label.map(space_name).filter(|label| !label.is_empty())
+}
+
+/// A record whose id no live workspace has, or whose id another live
+/// workspace now has: herdr's ids restart with its server, and a rebuild
+/// numbers the workspaces again from 1.
+fn displaced(id: &str, seen: Seen, lives: &[LiveWorkspace]) -> bool {
+    lives
+        .iter()
+        .find(|live| live.id == id)
+        .is_none_or(|live| same_workspace(seen, live.seen) == Same::No)
+}
+
+/// How many live workspaces have `label`.
+fn live_with_label(label: &str, lives: &[LiveWorkspace]) -> usize {
+    lives
+        .iter()
+        .filter(|live| label_of(live.seen).as_deref() == Some(label))
+        .count()
+}
+
+/// The record of the live workspace `target`: by its id, as
+/// `same_workspace` judges it, the best of them (`best`). When none of
+/// those is the same workspace, the TUI may have renumbered its workspaces:
+/// a displaced record that shares a terminal with `target` (the newest), or
+/// else the one displaced record with `target`'s label, when no other live
+/// workspace has it. A record by `target`'s id that is another workspace is
+/// returned as `Same::No` only when nothing else matched, so its plan note
+/// does not name another workspace's copy.
+pub fn match_live<T: Clone>(
+    records: &[WorkspaceRecord<T>],
+    lives: &[LiveWorkspace],
+    target: &str,
+) -> Option<Matched<T>> {
+    let target_seen = lives
+        .iter()
+        .find(|live| live.id == target)
+        .map(|live| live.seen);
+    let direct = best(
+        records.iter().filter(|record| record.id == target),
+        |record| target_seen.map_or(Same::No, |seen| same_workspace(record.seen, seen)),
+        |record| record.at,
+    );
+    let matched = |record: &WorkspaceRecord<T>, same, was: Option<&str>| Matched {
+        value: record.value.clone(),
+        same,
+        at: record.at,
+        was: was.map(String::from),
+    };
+    if let Some((record, same)) = &direct
+        && *same != Same::No
+    {
+        return Some(matched(record, *same, None));
+    }
+    if let Some(target_seen) = target_seen {
+        let candidates: Vec<&WorkspaceRecord<T>> = records
+            .iter()
+            .filter(|record| displaced(record.id, record.seen, lives))
+            .collect();
+        if let Some(record) = candidates
+            .iter()
+            .filter(|record| shares_terminal(record.seen, target_seen))
+            .max_by_key(|record| record.at)
+        {
+            return Some(matched(record, Same::Terminal, Some(record.id)));
+        }
+        if let Some(label) =
+            label_of(target_seen).filter(|label| live_with_label(label, lives) == 1)
+        {
+            let labelled: Vec<_> = candidates
+                .iter()
+                .filter(|record| label_of(record.seen).as_deref() == Some(label.as_str()))
+                .collect();
+            if let [record] = labelled.as_slice() {
+                return Some(matched(record, Same::Label, Some(record.id)));
+            }
+        }
+    }
+    direct.map(|(record, same)| matched(record, same, None))
+}
+
+/// The live workspace `record` is: the one with its id, as `same_workspace`
+/// judges it; else, after the TUI renumbered its workspaces, one that shares
+/// a terminal with it, or else the one live workspace with its label when
+/// no other displaced record of `pool` (the records of the same kind and
+/// session) has that label. Returns the live id, how it matched, and the
+/// recorded id when it was renumbered; `Same::No` with the recorded id when
+/// a live workspace has that id and nothing else matched.
+pub fn live_of<T>(
+    record: &WorkspaceRecord<T>,
+    pool: &[(&str, Seen)],
+    lives: &[LiveWorkspace],
+) -> Option<(String, Same, Option<String>)> {
+    let by_id = lives.iter().find(|live| live.id == record.id);
+    if let Some(live) = by_id {
+        let same = same_workspace(record.seen, live.seen);
+        if same != Same::No {
+            return Some((live.id.to_string(), same, None));
+        }
+    }
+    let renumbered = Some(record.id.to_string());
+    if let Some(live) = lives
+        .iter()
+        .find(|live| shares_terminal(record.seen, live.seen))
+    {
+        return Some((live.id.to_string(), Same::Terminal, renumbered));
+    }
+    if let Some(label) = label_of(record.seen).filter(|label| live_with_label(label, lives) == 1) {
+        let displaced_with_label = pool
+            .iter()
+            .filter(|(id, seen)| displaced(id, *seen, lives))
+            .filter(|(_, seen)| label_of(*seen).as_deref() == Some(label.as_str()))
+            .count();
+        if displaced_with_label == 1
+            && let Some(live) = lives
+                .iter()
+                .find(|live| label_of(live.seen).as_deref() == Some(label.as_str()))
+        {
+            return Some((live.id.to_string(), Same::Label, renumbered));
+        }
+    }
+    by_id.map(|live| (live.id.to_string(), Same::No, None))
+}
+
 /// Of several records of one TUI workspace id, the one that matches the
 /// live workspace best: a shared terminal over the label alone over
 /// neither, then the newest.
@@ -228,6 +425,23 @@ pub fn best<T>(
             (candidate, same)
         })
         .max_by_key(|(candidate, same)| (rank(*same), at(candidate)))
+}
+
+/// Whether two records of a TUI session are one workspace: the same
+/// record, the same id that `same_workspace` matches, or a shared terminal
+/// (herdr never reuses a terminal id).
+fn same_workspace_of(a: &AppSource, b: &AppSource) -> bool {
+    a.machine == b.machine
+        && a.session == b.session
+        && (a == b
+            || a.same_id(b) && same_workspace(a.seen(), b.seen()) != Same::No
+            || shares_terminal(a.seen(), b.seen()))
+}
+
+/// A partial copy with no space and no terminal to look for: only a
+/// timed-out one is kept like that, as one that may have left a space.
+pub fn names_nothing(created: &AppCreated) -> bool {
+    created.space.is_none() && created.terminals.is_empty()
 }
 
 /// The core state directory: the ledger lives where the app is.
@@ -270,22 +484,7 @@ impl Ledger {
             }
         }
         let path = dir.join("migrated.json");
-        let file: File = match std::fs::symlink_metadata(&path) {
-            Ok(_) => store::read_json(&path)
-                .with_context(|| format!("{} is unreadable", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => File {
-                tool: TOOL.into(),
-                schema: LEDGER_SCHEMA,
-                entries: Vec::new(),
-                partial: Vec::new(),
-            },
-            Err(e) => return Err(e.into()),
-        };
-        ensure!(
-            native_tool(&file.tool) && file.schema == LEDGER_SCHEMA,
-            "{} is not a herdr-revive migration ledger",
-            path.display()
-        );
+        let file = load(&path)?;
         Ok(Self {
             path,
             entries: file.entries,
@@ -300,11 +499,33 @@ impl Ledger {
         find_app(&self.entries, source)
     }
 
+    /// The newest partial copy of the TUI workspace with `source`'s id.
     pub fn partial_to_app(
         &self,
         source: &AppSource,
     ) -> Option<Recorded<'_, AppSource, AppCreated>> {
-        find_app(&self.partial, source)
+        self.partials_to_app(source).pop()
+    }
+
+    /// Every partial copy of the TUI workspace with `source`'s id, oldest
+    /// first: a later run of that source does not make an earlier partial
+    /// space go away.
+    pub fn partials_to_app(&self, source: &AppSource) -> Vec<Recorded<'_, AppSource, AppCreated>> {
+        self.partial
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::ToApp {
+                    source: s,
+                    created,
+                    at,
+                } if s.same_id(source) => Some(Recorded {
+                    source: s,
+                    created,
+                    at: *at,
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The copy of `source` into the TUI session `session`.
@@ -378,26 +599,164 @@ impl Ledger {
         )
     }
 
+    /// Records a full copy. The source's partial copies stay while they can
+    /// still be open (`prune_partials`), except a timed-out one that names
+    /// nothing, which nothing could tell is closed.
     pub fn record(&mut self, entry: Entry) -> Result<()> {
-        self.partial.retain(|old| !old.same_source(&entry));
-        self.entries.retain(|old| !old.same_source(&entry));
-        // The TUI has just given this id to the new workspace, so a copy
-        // recorded under it before is gone.
-        if let Entry::ToTui { created, .. } = &entry {
-            self.entries.retain(|old| match old {
-                Entry::ToTui { created: older, .. } => {
-                    older.session != created.session || older.workspace_id != created.workspace_id
-                }
-                Entry::ToApp { .. } => true,
-            });
-        }
+        // A full copy drops a timed-out partial that names nothing only when
+        // it is the same workspace: another workspace may have its id after
+        // a renumbering, and that partial is the only record of a space it
+        // may have left (`to_app::apply` drops one matched by its label).
+        self.partial.retain(|old| match (old, &entry) {
+            (
+                Entry::ToApp {
+                    source: a, created, ..
+                },
+                Entry::ToApp { source: b, .. },
+            ) if names_nothing(created) => !same_workspace_of(a, b),
+            _ => true,
+        });
+        // A copy recorded under the same TUI workspace id is replaced only
+        // when it is that workspace: after the TUI renumbers its workspaces
+        // another one may hold the id, and its copy is still found
+        // (`match_live`, `live_of`). A space is a copy of one workspace, so
+        // a new record of it replaces the old one.
+        self.entries.retain(|old| match (old, &entry) {
+            (
+                Entry::ToApp {
+                    source: a,
+                    created: made_a,
+                    ..
+                },
+                Entry::ToApp {
+                    source: b,
+                    created: made_b,
+                    ..
+                },
+            ) => {
+                let same_space = made_a.space.is_some() && made_a.space == made_b.space;
+                !(same_space || a.same_id(b) && same_workspace(a.seen(), b.seen()) != Same::No)
+            }
+            _ => !old.same_source(&entry),
+        });
         self.entries.push(entry);
         self.save()
     }
 
+    /// The full copies to the app of `machine`'s TUI session `session`.
+    pub fn app_entries(
+        &self,
+        machine: Option<&str>,
+        session: &str,
+    ) -> Vec<Recorded<'_, AppSource, AppCreated>> {
+        app_in(&self.entries, machine, session)
+    }
+
+    /// The partial copies to the app of `machine`'s TUI session `session`.
+    pub fn app_partials(
+        &self,
+        machine: Option<&str>,
+        session: &str,
+    ) -> Vec<Recorded<'_, AppSource, AppCreated>> {
+        app_in(&self.partial, machine, session)
+    }
+
+    /// The copies into TUI session `session`.
+    pub fn tui_entries(&self, session: &str) -> Vec<Recorded<'_, TuiSource, TuiCreated>> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::ToTui {
+                    source,
+                    created,
+                    at,
+                } if created.session == session => Some(Recorded {
+                    source,
+                    created,
+                    at: *at,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Adds a partial copy beside the source's earlier ones. The same copy
+    /// recorded again replaces itself, and so does the run's own pending
+    /// entry (same source, same `at`).
     pub fn record_partial(&mut self, entry: Entry) -> Result<()> {
-        self.partial.retain(|old| !old.same_source(&entry));
+        self.partial.retain(|old| match (old, &entry) {
+            (
+                Entry::ToApp {
+                    source: a,
+                    created: made_a,
+                    at: at_a,
+                },
+                Entry::ToApp {
+                    source: b,
+                    created: made_b,
+                    at: at_b,
+                },
+            ) => {
+                // A copy that names nothing cannot be told from another such.
+                !(a.same_id(b)
+                    && (at_a == at_b
+                        || (!names_nothing(made_b)
+                            && made_a.space == made_b.space
+                            && made_a.terminals == made_b.terminals)))
+            }
+            _ => !old.same_source(&entry),
+        });
         self.partial.push(entry);
+        self.save()
+    }
+
+    /// `now`, or the next millisecond no partial copy of `source` uses yet,
+    /// so a run's own entries are told apart from an earlier run's by `at`.
+    pub fn fresh_at(&self, source: &AppSource, now: u64) -> u64 {
+        let used: Vec<u64> = self
+            .partials_to_app(source)
+            .iter()
+            .map(|partial| partial.at)
+            .collect();
+        let mut at = now;
+        while used.contains(&at) {
+            at += 1;
+        }
+        at
+    }
+
+    /// Drops the partial copy of `source` recorded at `at`: the pending
+    /// entry of a run that ended having made nothing.
+    pub fn forget_partial(&mut self, source: &AppSource, at: u64) -> Result<()> {
+        let before = self.partial.len();
+        self.partial.retain(|entry| {
+            !matches!(entry, Entry::ToApp { source: s, at: when, .. } if s.same_id(source) && *when == at)
+        });
+        if self.partial.len() == before {
+            return Ok(());
+        }
+        self.save()
+    }
+
+    /// Drops the partial copies to `machine`'s app (`None`: this one's) that
+    /// are closed: `open` says whether the app still lists its space or one
+    /// of its terminals. A timed-out one that names nothing stays until its
+    /// source is copied in full (`record`).
+    pub fn prune_partials(
+        &mut self,
+        machine: Option<&str>,
+        open: impl Fn(&AppCreated) -> bool,
+    ) -> Result<()> {
+        let before = self.partial.len();
+        self.partial.retain(|entry| match entry {
+            Entry::ToApp {
+                source, created, ..
+            } => source.machine.as_deref() != machine || names_nothing(created) || open(created),
+            Entry::ToTui { .. } => true,
+        });
+        if self.partial.len() == before {
+            return Ok(());
+        }
         self.save()
     }
 
@@ -412,6 +771,46 @@ impl Ledger {
             },
         )
     }
+}
+
+fn load(path: &Path) -> Result<File> {
+    let file: File = match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            store::read_json(path).with_context(|| format!("{} is unreadable", path.display()))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => File {
+            tool: TOOL.into(),
+            schema: LEDGER_SCHEMA,
+            entries: Vec::new(),
+            partial: Vec::new(),
+        },
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(
+        native_tool(&file.tool) && file.schema == LEDGER_SCHEMA,
+        "{} is not a herdr-revive migration ledger",
+        path.display()
+    );
+    Ok(file)
+}
+
+/// Every entry in `dir`'s ledger, partial copies included, read without the
+/// lock and without creating anything: a run that only looks at this
+/// machine's copies for another machine's plan. Each save replaces the file
+/// whole, so a read never sees half of one.
+pub fn read(dir: &Path) -> Result<Vec<Entry>> {
+    let file = load(&dir.join("migrated.json"))?;
+    Ok(file.entries.into_iter().chain(file.partial).collect())
+}
+
+/// `read` without the partial copies.
+pub fn read_copies(dir: &Path) -> Result<Vec<Entry>> {
+    Ok(load(&dir.join("migrated.json"))?.entries)
+}
+
+/// Only the partial copies of `dir`'s ledger.
+pub fn read_partials(dir: &Path) -> Result<Vec<Entry>> {
+    Ok(load(&dir.join("migrated.json"))?.partial)
 }
 
 fn find_app<'a>(
@@ -455,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_copy_survives_reopening_and_replaces_its_partial() {
+    fn a_recorded_copy_survives_reopening_and_keeps_a_partial_that_names_its_space() {
         let root = tempfile::tempdir().unwrap();
         {
             let mut ledger = Ledger::open(root.path()).unwrap();
@@ -481,7 +880,11 @@ mod tests {
         let ledger = Ledger::open(root.path()).unwrap();
         let copied = ledger.copied_to_app(&source("w1")).unwrap();
         assert_eq!((copied.created, copied.at), (&copy("s2"), 2));
-        assert_eq!(ledger.partial_to_app(&source("w1")), None);
+        assert_eq!(
+            ledger.partial_to_app(&source("w1")).map(|r| r.created),
+            Some(&copy("s1")),
+            "s1 may still be open"
+        );
         assert_eq!(ledger.copied_to_app(&source("w2")), None);
         let mut other_machine = source("w1");
         other_machine.machine = Some("canix".into());
@@ -558,19 +961,128 @@ mod tests {
             })
             .unwrap();
         ledger.record(to_tui("s9", "a", "w1", 5)).unwrap();
-        let spaces: Vec<&str> = ledger
+        ledger.record(to_tui("s2", "a", "w3", 6)).unwrap();
+        let spaces: Vec<(&str, &str)> = ledger
             .entries
             .iter()
             .filter_map(|entry| match entry {
-                Entry::ToTui { source, .. } => Some(source.space.as_str()),
+                Entry::ToTui {
+                    source, created, ..
+                } => Some((source.space.as_str(), created.workspace_id.as_str())),
                 Entry::ToApp { .. } => None,
             })
             .collect();
-        assert_eq!(spaces, ["s2", "s3", "s9"], "only s1 had (a, w1)");
+        assert_eq!(
+            spaces,
+            [("s1", "w1"), ("s3", "w1"), ("s9", "w1"), ("s2", "w3")],
+            "a renumbered TUI may have moved s1's workspace; s2 was copied again"
+        );
         assert!(
             ledger.app_space_origin("s5").is_some(),
             "to_app entries stay"
         );
+    }
+
+    #[test]
+    fn a_copy_to_the_app_replaces_the_same_workspace_or_space_only() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(root.path()).unwrap();
+        let seen = |terminal: &str, label: &str| {
+            let mut source = source("w1");
+            source.terminal_ids = Some(vec![terminal.to_string()]);
+            source.label = Some(label.to_string());
+            source
+        };
+        let mut record = |source: AppSource, space: &str, at| {
+            ledger
+                .record(Entry::ToApp {
+                    source,
+                    created: copy(space),
+                    at,
+                })
+                .unwrap();
+        };
+        record(seen("t_api", "api"), "s1", 1);
+        record(seen("t_web", "web"), "s2", 2);
+        record(seen("t_api", "api"), "s3", 3);
+        record(seen("t_new", "new"), "s2", 4);
+        let spaces: Vec<(&str, &str)> = ledger
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::ToApp {
+                    source, created, ..
+                } => Some((created.space.as_deref()?, source.label.as_deref()?)),
+                Entry::ToTui { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            spaces,
+            [("s3", "api"), ("s2", "new")],
+            "w1 as web is another workspace than api, but s2 is one space"
+        );
+    }
+
+    #[test]
+    fn a_record_is_matched_by_id_then_terminal_then_a_unique_label() {
+        fn seen<'a>(terminal_ids: &'a [String], label: &'a str) -> Seen<'a> {
+            Seen {
+                terminal_ids: Some(terminal_ids),
+                label: Some(label),
+            }
+        }
+        let [t_api, t_web, t_new, t_old] =
+            ["t_api", "t_web", "t_new", "t_old"].map(|id| vec![id.to_string()]);
+        let (t_api, t_web, t_new, t_old) = (&t_api[..], &t_web[..], &t_new[..], &t_old[..]);
+        let record = |value: &'static str, id, seen, at| WorkspaceRecord {
+            value,
+            id,
+            seen,
+            at,
+        };
+        let lives = [
+            LiveWorkspace {
+                id: "w1",
+                seen: seen(t_api, "[1] api"),
+            },
+            LiveWorkspace {
+                id: "w2",
+                seen: seen(t_new, "[2] web"),
+            },
+        ];
+        let records = [
+            record("s_api", "w2", seen(t_api, "api"), 1),
+            record("s_web", "w3", seen(t_old, "web"), 2),
+        ];
+        let w1 = match_live(&records, &lives, "w1").unwrap();
+        assert_eq!(
+            (w1.value, w1.same, w1.was.as_deref()),
+            ("s_api", Same::Terminal, Some("w2"))
+        );
+        let w2 = match_live(&records, &lives, "w2").unwrap();
+        assert_eq!(
+            (w2.value, w2.same, w2.was.as_deref()),
+            ("s_web", Same::Label, Some("w3"))
+        );
+        assert_eq!(
+            live_of(
+                &records[1],
+                &[("w2", records[0].seen), ("w3", records[1].seen)],
+                &lives
+            ),
+            Some(("w2".to_string(), Same::Label, Some("w3".to_string())))
+        );
+        // A second displaced "web" record: the label tells neither apart, and
+        // the record under w2 is returned as another workspace's.
+        let records = [
+            records[0].clone(),
+            records[1].clone(),
+            record("s_old", "w4", seen(t_web, "web"), 3),
+        ];
+        let w2 = match_live(&records, &lives, "w2").unwrap();
+        assert_eq!((w2.value, w2.same, w2.was), ("s_api", Same::No, None));
+        let pool: Vec<(&str, Seen)> = records.iter().map(|r| (r.id, r.seen)).collect();
+        assert_eq!(live_of(&records[1], &pool, &lives), None);
     }
 
     #[test]
@@ -588,6 +1100,99 @@ mod tests {
         );
         assert_eq!(ranked(&[(Same::No, 3), (Same::No, 7)]), Some((Same::No, 7)));
         assert_eq!(ranked(&[]), None);
+    }
+
+    #[test]
+    fn partial_copies_of_a_source_add_up_and_closed_ones_are_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(root.path()).unwrap();
+        let partial = |space: Option<&str>, unknown: bool, at| Entry::ToApp {
+            source: source("w1"),
+            created: AppCreated {
+                space: space.map(String::from),
+                terminals: vec![],
+                unknown,
+            },
+            at,
+        };
+        ledger
+            .record_partial(partial(Some("s1"), false, 1))
+            .unwrap();
+        ledger
+            .record_partial(partial(Some("s2"), false, 2))
+            .unwrap();
+        ledger
+            .record_partial(partial(Some("s1"), false, 3))
+            .unwrap();
+        ledger.record_partial(partial(None, true, 4)).unwrap();
+        let spaces = |ledger: &Ledger| {
+            ledger
+                .partials_to_app(&source("w1"))
+                .iter()
+                .map(|p| (p.created.space.clone(), p.at))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            spaces(&ledger),
+            [(Some("s2".into()), 2), (Some("s1".into()), 3), (None, 4)],
+            "the same copy again replaces itself"
+        );
+        ledger
+            .prune_partials(None, |created| created.space.as_deref() == Some("s2"))
+            .unwrap();
+        assert_eq!(
+            spaces(&ledger),
+            [(Some("s2".into()), 2), (None, 4)],
+            "a timed-out one naming nothing stays"
+        );
+        ledger
+            .record(Entry::ToApp {
+                source: source("w1"),
+                created: copy("s3"),
+                at: 5,
+            })
+            .unwrap();
+        assert_eq!(
+            spaces(&ledger),
+            [(Some("s2".into()), 2)],
+            "the full copy drops only the one naming nothing"
+        );
+    }
+
+    #[test]
+    fn a_runs_pending_partial_is_told_apart_by_its_own_time() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::open(root.path()).unwrap();
+        let nothing = AppCreated {
+            unknown: true,
+            ..AppCreated::default()
+        };
+        let partial = |created: AppCreated, at| Entry::ToApp {
+            source: source("w1"),
+            created,
+            at,
+        };
+        // An earlier run's timed-out copy, then this run's pending entry in
+        // the same millisecond.
+        ledger.record_partial(partial(nothing.clone(), 7)).unwrap();
+        let at = ledger.fresh_at(&source("w1"), 7);
+        assert_eq!(at, 8);
+        ledger.record_partial(partial(nothing.clone(), at)).unwrap();
+        assert_eq!(ledger.partials_to_app(&source("w1")).len(), 2);
+        // The run ends: what it made replaces its pending entry only.
+        ledger.record_partial(partial(copy("s1"), at)).unwrap();
+        let ats: Vec<_> = ledger
+            .partials_to_app(&source("w1"))
+            .iter()
+            .map(|p| (p.at, p.created.space.clone()))
+            .collect();
+        assert_eq!(ats, [(7, None), (8, Some("s1".into()))]);
+        // A run that made nothing drops its own pending entry only.
+        let at = ledger.fresh_at(&source("w1"), 7);
+        assert_eq!(at, 9);
+        ledger.record_partial(partial(nothing, at)).unwrap();
+        ledger.forget_partial(&source("w1"), at).unwrap();
+        assert_eq!(ledger.partials_to_app(&source("w1")).len(), 2);
     }
 
     #[test]
@@ -687,6 +1292,34 @@ mod tests {
             LEDGER_SCHEMA, 1,
             "existing migrated.json files are schema 1"
         );
+    }
+
+    #[test]
+    fn read_lists_entries_and_partials_without_locking_or_creating() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("none");
+        assert_eq!(read(&missing).unwrap(), Vec::new());
+        assert!(!missing.exists());
+        let mut ledger = Ledger::open(root.path()).unwrap();
+        ledger
+            .record(Entry::ToApp {
+                source: source("w1"),
+                created: copy("s1"),
+                at: 1,
+            })
+            .unwrap();
+        ledger
+            .record_partial(Entry::ToApp {
+                source: source("w2"),
+                created: copy("s2"),
+                at: 2,
+            })
+            .unwrap();
+        let entries = read(root.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(&entries[1], Entry::ToApp { source, .. } if source.workspace_id == "w2"));
+        std::fs::write(root.path().join("migrated.json"), "{").unwrap();
+        assert!(read(root.path()).is_err());
     }
 
     #[test]

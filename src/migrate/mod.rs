@@ -3,6 +3,7 @@
 
 pub mod external;
 pub mod ledger;
+pub mod remote;
 pub mod to_app;
 pub mod to_tui;
 pub mod tree;
@@ -11,7 +12,7 @@ pub mod tui;
 use crate::core::setup::{self, Confirm};
 use crate::model::{Config, SCHEMA, Scope, Snapshot, TOOL};
 use crate::transport::Host;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use ledger::AppCreated;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -140,6 +141,19 @@ pub struct Applied {
     pub created: Value,
 }
 
+impl Summary {
+    pub fn of(to: Side, lines: &[PlanLine]) -> Self {
+        let count = |status: Status| lines.iter().filter(|line| line.status == status).count();
+        let create = count(Status::Create);
+        Self {
+            create,
+            skip: count(Status::Skip),
+            unchanged: count(Status::Unchanged),
+            ratios_lost: to == Side::App && create > 0,
+        }
+    }
+}
+
 /// The TUI session a `--to tui` plan copies into and its live workspaces.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiSession {
@@ -151,9 +165,25 @@ pub struct TuiSession {
     pub terminal_ids: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// The app spaces of the machine that planned, so the copies of closed
+    /// ones are left out of matching (`remote::skip_app_copies`). `None` in
+    /// plans from before the field: every recorded copy counts.
+    #[serde(default)]
+    pub spaces: Option<Vec<String>>,
 }
 
 impl TuiSession {
+    /// Its live workspaces, as `ledger::live_of` reads them.
+    pub fn lives(&self) -> Vec<ledger::LiveWorkspace<'_>> {
+        self.workspaces
+            .iter()
+            .map(|id| ledger::LiveWorkspace {
+                id,
+                seen: self.seen(id),
+            })
+            .collect()
+    }
+
     pub fn seen(&self, workspace_id: &str) -> ledger::Seen<'_> {
         ledger::Seen {
             terminal_ids: self.terminal_ids.get(workspace_id).map(Vec::as_slice),
@@ -171,24 +201,30 @@ pub struct Report {
     /// `None` when what was copied is unknown: another machine's result
     /// could not be read.
     pub applied: Option<Vec<Applied>>,
+    /// `--to tui` only. A run for `--machine M` reads it from M's plan to
+    /// leave out the spaces this machine's `--to app` made from a TUI
+    /// workspace of M that still exists; M's ledger does not record those.
+    /// Reports from before this field have none.
+    #[serde(default)]
+    pub tui_session: Option<TuiSession>,
+    /// What the run warned about without stopping: a pane the capture could
+    /// not read in full, a command the policy turns into a shell, a copy
+    /// another machine or the TUI could not record. The text output prints
+    /// them on stderr; reports from before this field have none.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl Report {
     pub fn new(to: Side, machine: Option<&str>, lines: Vec<PlanLine>) -> Self {
-        let count = |status: Status| lines.iter().filter(|line| line.status == status).count();
-        let create = count(Status::Create);
-        let summary = Summary {
-            create,
-            skip: count(Status::Skip),
-            unchanged: count(Status::Unchanged),
-            ratios_lost: to == Side::App && create > 0,
-        };
         Self {
             to,
             machine: machine.map(String::from),
+            summary: Summary::of(to, &lines),
             lines,
-            summary,
             applied: Some(Vec::new()),
+            tui_session: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -391,6 +427,12 @@ pub fn drive(
         finish(result, written)?;
         return Ok(0);
     }
+    // The text output keeps warnings on stderr: those of the plan before it,
+    // those of the copy after what it made.
+    let planned = report.warnings.len();
+    for warning in &report.warnings {
+        writeln!(errors, "herdr-revive: warning: {warning}")?;
+    }
     output.write_all(render(&report).as_bytes())?;
     if !creates {
         writeln!(output, "nothing to copy")?;
@@ -409,6 +451,10 @@ pub fn drive(
                 applied_text(report.to, &applied.created)
             );
             output.write_all(setup::render_line("copied", &item, None).as_bytes())?;
+        }
+        output.flush()?;
+        for warning in report.warnings.iter().skip(planned) {
+            writeln!(errors, "herdr-revive: warning: {warning}")?;
         }
         Ok(())
     })();
@@ -446,25 +492,47 @@ fn finish(result: Result<()>, written: Result<()>) -> Result<()> {
     }
 }
 
+/// What `capture_each` read: the workspaces it could capture, the capture's
+/// warnings for the report, and each workspace it could not capture with
+/// the reason, which the plan shows as a `skip` line.
+pub struct Captured {
+    pub snapshot: Snapshot,
+    pub warnings: Vec<String>,
+    pub uncaptured: BTreeMap<String, String>,
+}
+
 /// Captures each workspace on its own, so a pane that cannot be captured
-/// stops only a copy that includes it, and the error names its workspace.
+/// leaves out only the workspace it is in.
 pub fn capture_each(
     host: &mut impl Host,
     session: &str,
     workspaces: &[String],
     focused: Option<String>,
     config: &Config,
-    what: &str,
-) -> Result<Snapshot> {
+) -> Result<Captured> {
     let mut panes = Vec::new();
     let mut layout = Vec::new();
+    let mut warnings = Vec::new();
+    let mut uncaptured = BTreeMap::new();
     for id in workspaces {
-        let (part, _) = crate::capture::capture(host, session, Some(id), config)
-            .with_context(|| format!("cannot capture {what} {id} (--only can leave it out)"))?;
-        panes.extend(part.panes);
-        layout.extend(part.layout);
+        match crate::capture::capture_noting(host, session, Some(id), config) {
+            Ok((part, _, noted)) => {
+                panes.extend(part.panes);
+                layout.extend(part.layout);
+                warnings.extend(noted);
+            }
+            Err(error) => {
+                uncaptured.insert(id.clone(), format!("{error:#}"));
+            }
+        }
     }
     panes.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+    let captured = |id: &String| {
+        layout
+            .iter()
+            .any(|w: &crate::layout::WorkspaceLayout| &w.workspace_id == id)
+    };
+    let focused_workspace_id = focused.filter(captured);
     let snapshot = Snapshot {
         tool: TOOL.into(),
         schema: SCHEMA,
@@ -473,10 +541,19 @@ pub fn capture_each(
         scope: Scope::Session,
         panes,
         layout,
-        focused_workspace_id: focused.filter(|id| workspaces.contains(id)),
+        focused_workspace_id,
     };
     snapshot.validate()?;
-    Ok(snapshot)
+    Ok(Captured {
+        snapshot,
+        warnings,
+        uncaptured,
+    })
+}
+
+/// The skip reason of a source that could not be captured.
+pub fn uncaptured_reason(reason: &str) -> String {
+    format!("cannot capture: {reason}")
 }
 
 #[cfg(test)]
@@ -527,6 +604,54 @@ mod tests {
     }
 
     #[test]
+    fn warnings_go_into_the_json_report_and_to_stderr_in_text() {
+        let run = |json: bool| {
+            let mut report = Report::new(Side::App, Some("canix"), lines());
+            report.warnings = vec!["pane w1:p2: a capture warning".into()];
+            let (mut input, mut output, mut errors) = (&b""[..], Vec::new(), Vec::new());
+            let code = drive(
+                report,
+                Confirm::Yes,
+                json,
+                &mut input,
+                &mut output,
+                &mut errors,
+                false,
+                |report| {
+                    report.warnings.push("canix did not record it".into());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(code, 0);
+            (
+                String::from_utf8(output).unwrap(),
+                String::from_utf8(errors).unwrap(),
+            )
+        };
+        let (output, errors) = run(true);
+        let printed: Report = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            printed.warnings,
+            ["pane w1:p2: a capture warning", "canix did not record it"]
+        );
+        assert_eq!(errors, "", "the JSON carries them");
+        let (output, errors) = run(false);
+        assert!(!output.contains("warning"), "{output}");
+        assert_eq!(
+            errors,
+            "herdr-revive: warning: pane w1:p2: a capture warning\n\
+             herdr-revive: warning: canix did not record it\n"
+        );
+        let older: Report = serde_json::from_value(serde_json::json!({
+            "to": "app", "machine": null, "lines": [],
+            "summary": {"create": 0, "skip": 0, "unchanged": 0, "ratios_lost": false},
+            "applied": []}))
+        .unwrap();
+        assert!(older.warnings.is_empty());
+    }
+
+    #[test]
     fn the_json_shape_is_stable() {
         let mut report = Report::new(Side::Tui, Some("canix"), lines());
         report.record(Applied {
@@ -540,7 +665,18 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(keys, ["to", "machine", "lines", "summary", "applied"]);
+        assert_eq!(
+            keys,
+            [
+                "to",
+                "machine",
+                "lines",
+                "summary",
+                "applied",
+                "tui_session",
+                "warnings"
+            ]
+        );
         let line: Vec<&str> = value["lines"][0]
             .as_object()
             .unwrap()
@@ -568,8 +704,93 @@ mod tests {
         );
         assert_eq!(value["to"], "tui");
         assert_eq!(value["lines"][1]["status"], "skip");
+        assert_eq!(value["tui_session"], serde_json::Value::Null);
         let back: Report = serde_json::from_value(value).unwrap();
         assert_eq!(back, report);
+    }
+
+    #[test]
+    fn a_workspace_that_cannot_be_captured_keeps_the_cause_in_its_reason() {
+        struct Unreadable;
+        impl Host for Unreadable {
+            fn snapshot(&mut self) -> Result<crate::model::LiveSnapshot> {
+                anyhow::Context::context(
+                    Err(anyhow::anyhow!("permission denied")),
+                    "Claude HOME is inaccessible",
+                )
+            }
+            fn process_info(&mut self, _: &str) -> Result<crate::model::ProcessInfo> {
+                bail!("not asked")
+            }
+            fn pane(&mut self, _: &str) -> Result<crate::model::LivePane> {
+                bail!("not asked")
+            }
+            fn run(&mut self, _: &str, _: &str) -> Result<()> {
+                bail!("not asked")
+            }
+        }
+        let captured = capture_each(
+            &mut Unreadable,
+            &"a".repeat(64),
+            &["w1".to_string()],
+            None,
+            &Config::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            captured.uncaptured["w1"],
+            "Claude HOME is inaccessible: permission denied"
+        );
+        assert_eq!(
+            uncaptured_reason(&captured.uncaptured["w1"]),
+            "cannot capture: Claude HOME is inaccessible: permission denied"
+        );
+    }
+
+    #[test]
+    fn a_report_names_its_tui_session_and_older_reports_have_none() {
+        let mut report = Report::new(Side::Tui, None, lines());
+        report.tui_session = Some(TuiSession {
+            session: "b".repeat(64),
+            workspaces: vec!["w1".into(), "w4".into()],
+            terminal_ids: BTreeMap::from([("w1".to_string(), vec!["term_1".to_string()])]),
+            labels: BTreeMap::from([("w1".to_string(), "[1] work".to_string())]),
+            spaces: Some(vec!["s1".into()]),
+        });
+        let mut value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            value["tui_session"],
+            serde_json::json!({"session": "b".repeat(64), "workspaces": ["w1", "w4"],
+                               "terminal_ids": {"w1": ["term_1"]}, "labels": {"w1": "[1] work"},
+                               "spaces": ["s1"]})
+        );
+        let back: Report = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(back, report);
+        let mut without_ids = value.clone();
+        without_ids["tui_session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("terminal_ids");
+        without_ids["tui_session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("labels");
+        without_ids["tui_session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("spaces");
+        without_ids["lines"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("notes");
+        let older: Report = serde_json::from_value(without_ids).unwrap();
+        let older_session = older.tui_session.unwrap();
+        assert_eq!(older_session.seen("w1"), ledger::Seen::default());
+        assert_eq!(older_session.spaces, None);
+        assert_eq!(older.lines[0].notes, Vec::<String>::new());
+        value.as_object_mut().unwrap().remove("tui_session");
+        let older: Report = serde_json::from_value(value).unwrap();
+        assert_eq!(older.tui_session, None);
     }
 
     fn driven(
