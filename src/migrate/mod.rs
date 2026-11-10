@@ -4,6 +4,7 @@
 pub mod external;
 pub mod ledger;
 pub mod to_app;
+pub mod to_tui;
 pub mod tree;
 pub mod tui;
 
@@ -14,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use ledger::AppCreated;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
@@ -136,6 +138,28 @@ pub struct Summary {
 pub struct Applied {
     pub source: String,
     pub created: Value,
+}
+
+/// The TUI session a `--to tui` plan copies into and its live workspaces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiSession {
+    pub session: String,
+    pub workspaces: Vec<String>,
+    /// Each live workspace's terminal ids and label
+    /// (`ledger::same_workspace`). Plans from before these fields have none.
+    #[serde(default)]
+    pub terminal_ids: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+impl TuiSession {
+    pub fn seen(&self, workspace_id: &str) -> ledger::Seen<'_> {
+        ledger::Seen {
+            terminal_ids: self.terminal_ids.get(workspace_id).map(Vec::as_slice),
+            label: self.labels.get(workspace_id).map(String::as_str),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

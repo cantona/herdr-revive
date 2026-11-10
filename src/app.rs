@@ -1244,7 +1244,15 @@ pub fn run(cli: Cli) -> Result<Value> {
                 crate::layout::preview(&saved, &config)?
             } else {
                 ensure!(host.supports_layout(), "{CORE_UNSUPPORTED}");
-                crate::layout::rebuild(&mut host, &store, &socket, &config_dir, &saved, true)?
+                crate::layout::rebuild(
+                    &mut host,
+                    &store,
+                    &socket,
+                    &config_dir,
+                    &saved,
+                    true,
+                    crate::layout::Start::Direct,
+                )?
             }
         }
         Action::List => json!({"snapshots": store.list("snapshots")?}),
@@ -1371,6 +1379,7 @@ pub fn run(cli: Cli) -> Result<Value> {
                 &config_dir,
                 &read_selected(&store, None, Some(&name))?,
                 !no_focus,
+                crate::layout::Start::Direct,
             )?,
             SpaceAction::Import {
                 name,
@@ -1810,8 +1819,15 @@ fn manual_restore(
     );
     let mut result = restore(host, store, socket, config_dir, config, file, None, false)?;
     if reconstruction.is_some() {
-        result["reconstruction"] =
-            crate::layout::rebuild(host, store, socket, config_dir, &missing, true)?;
+        result["reconstruction"] = crate::layout::rebuild(
+            host,
+            store,
+            socket,
+            config_dir,
+            &missing,
+            true,
+            crate::layout::Start::Direct,
+        )?;
     }
     Ok(result)
 }
