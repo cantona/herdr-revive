@@ -605,6 +605,7 @@ cargo test --locked
 cargo build --release --locked
 REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/integration.py
 REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/core_integration.py
+REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/migrate_integration.py
 python3 tests/real_host.py
 REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/openssh.py
 python3 scripts/verify_install.py
