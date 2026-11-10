@@ -118,6 +118,14 @@ impl Node {
             Self::Split { first, .. } => first.first_leaf(),
         }
     }
+
+    pub fn first_pane_id(&self) -> &str {
+        match self {
+            Self::Pane { pane_id, .. } => pane_id,
+            Self::Split { first, .. } => first.first_pane_id(),
+        }
+    }
+
     fn launch_tree(&self, panes: &BTreeMap<&str, &SavedPane>, config: &Config) -> Result<Value> {
         match self {
             Self::Pane { pane_id, label } => {
