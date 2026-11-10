@@ -205,7 +205,16 @@ pub fn live_pane(record: &Value) -> Result<Option<LivePane>> {
         tab_id: tab_id(space, tab),
         pane_id: pane_id(space, address),
         terminal_id: address.into(),
-        cwd: record["cwd"].as_str().map(String::from),
+        // `cwd` is where the terminal started; a shell that has moved since
+        // is only seen through its foreground process, which core reads live.
+        // That folder counts only while it exists (Linux marks a removed one
+        // ` (deleted)`): a relaunch could not `cd` into it.
+        cwd: record
+            .pointer("/foreground/cwd")
+            .and_then(Value::as_str)
+            .and_then(platform::existing_folder)
+            .or_else(|| record.get("cwd").and_then(Value::as_str))
+            .map(String::from),
         agent: record
             .pointer("/status/app")
             .and_then(Value::as_str)
