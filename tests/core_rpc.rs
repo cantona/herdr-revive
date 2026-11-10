@@ -323,6 +323,28 @@ fn records_become_tui_shaped_panes() {
     assert_eq!(pane.agent.as_deref(), Some("claude-code"));
     assert!(pane.agent_session.is_none());
     assert_eq!(host::address_of(&pane.pane_id).unwrap(), "t7");
+
+    // A shell that has moved is seen through its foreground process.
+    let root = tempfile::tempdir().unwrap();
+    let sub = root.path().join("sub dir");
+    std::fs::create_dir(&sub).unwrap();
+    let sub = sub.to_str().unwrap();
+    let moved_to = |cwd: &str| {
+        let mut moved = rec.clone();
+        moved["foreground"] = json!({"argv": ["bash", "-l"], "cwd": cwd, "pid": 4243});
+        host::live_pane(&moved).unwrap().unwrap().cwd
+    };
+    assert_eq!(moved_to(sub).as_deref(), Some(sub));
+    // Linux marks a removed folder; one made again at that path is there.
+    assert_eq!(moved_to(&format!("{sub} (deleted)")).as_deref(), Some(sub));
+    // A folder that is gone cannot be entered: the terminal's own cwd stands.
+    let gone = root.path().join("gone");
+    let gone = gone.to_str().unwrap();
+    assert_eq!(
+        moved_to(&format!("{gone} (deleted)")).as_deref(),
+        Some("/work")
+    );
+    assert_eq!(moved_to(gone).as_deref(), Some("/work"));
 }
 
 #[test]

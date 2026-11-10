@@ -133,9 +133,11 @@ fn capture_once(
                     // from an unprivileged reader. What the platform still
                     // reveals, or the line the hook typed, stands in; for its
                     // unreadable cwd, its shell's, which the program started
-                    // in and the shell cannot change while it runs. (The
-                    // pane's own cwd is where the terminal was created, on
-                    // herdr-core.) A detected agent is never relaunched this
+                    // in and the shell cannot change while it runs. (On
+                    // herdr-core the pane's own cwd is the foreground's folder
+                    // only when core could read it, which it cannot for this
+                    // program; it is then where the terminal was created.)
+                    // A detected agent is never relaunched this
                     // way: a plain program would start a fresh session.
                     // When even the shell's cwd cannot be read, no command is
                     // saved: the terminal's own cwd would run it elsewhere.

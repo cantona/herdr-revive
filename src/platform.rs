@@ -163,6 +163,22 @@ pub fn startup_shell(info: &ProcessInfo, parent: u32) -> Result<Option<String>> 
     Ok(Some(interactive_shell_name(&shell)?))
 }
 
+/// Linux's mark on a process cwd whose folder was removed.
+pub const DELETED: &str = " (deleted)";
+
+/// A folder as it stands on this machine, or `None` when it is gone. Linux
+/// names a removed cwd `<path> (deleted)`, and a folder can be made again at
+/// that path (`rm -rf build && mkdir build`), so the path without the mark
+/// is what counts; a folder whose own name ends in the mark is itself.
+pub fn existing_folder(cwd: &str) -> Option<&str> {
+    let is_dir = |path: &str| Path::new(path).is_dir();
+    if is_dir(cwd) {
+        return Some(cwd);
+    }
+    let path = cwd.strip_suffix(DELETED)?;
+    is_dir(path).then_some(path)
+}
+
 pub fn shell_command(shell: &str, cwd: &str, argv: &[String]) -> Result<String> {
     ensure!(
         matches!(shell, "bash" | "dash" | "zsh"),
@@ -189,6 +205,32 @@ pub fn identity_connections() -> usize {
 #[cfg(test)]
 mod tests {
     use super::plain_shell_command_matches;
+
+    #[test]
+    fn a_folder_counts_by_its_path_without_the_removed_mark() {
+        let root = tempfile::tempdir().unwrap();
+        let build = root.path().join("build");
+        let marked = root.path().join("odd (deleted)");
+        std::fs::create_dir(&build).unwrap();
+        std::fs::create_dir(&marked).unwrap();
+        let text = |path: &std::path::Path| path.to_str().unwrap().to_string();
+        let (build, marked) = (text(&build), text(&marked));
+        assert_eq!(super::existing_folder(&build), Some(build.as_str()));
+        let recreated = format!("{build} (deleted)");
+        assert_eq!(
+            super::existing_folder(&recreated),
+            Some(build.as_str()),
+            "removed and made again at the same path"
+        );
+        assert_eq!(
+            super::existing_folder(&marked),
+            Some(marked.as_str()),
+            "a folder whose own name ends in the mark"
+        );
+        let gone = text(&root.path().join("gone"));
+        assert_eq!(super::existing_folder(&format!("{gone} (deleted)")), None);
+        assert_eq!(super::existing_folder(&gone), None);
+    }
 
     #[test]
     fn plain_shell_command_rejects_expansion_and_operators() {
