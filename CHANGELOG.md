@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.3.0 — 2026-11-10 (prerelease)
+
+- `herdr-revive migrate --to app` copies a herdr TUI session into Herdr
+  desktop app spaces, and `--to tui` copies the app's spaces into a TUI
+  session: workspaces or spaces and tabs with their names, the split
+  layout, each pane's cwd and command, and agents resumed. The source is
+  never changed. It prints a plan like `install` (`create`, `skip` with a
+  reason, `unchanged` when an earlier copy still exists) and asks first.
+  Runs that overlap on one machine are safe, `--machine` runs started
+  there included (a run holds the migration ledger's lock from before it
+  lists the destination); two machines must not migrate to or from the
+  same machine at the same time.
+  `--yes` applies, `--dry-run` only prints, `--json` (with one of those)
+  prints a report. Into the app, split sizes are not kept (the app's
+  commands take none); into the TUI, the layout is rebuilt with `restore
+  --recreate`'s journal and mod panes are left out. `--session` picks the
+  TUI session, `--only` the sources, and `--machine` copies between another
+  machine's TUI and its app spaces, which needs herdr-revive 0.3.0 there
+  and refuses `--socket`, `--config-dir`, `--state-dir` and `--herdr-bin`.
+  `--host` is refused. Each copy is recorded in
+  `~/.local/state/herdr-revive/migrated.json`, and a source that is itself
+  a copy from the other side is skipped while its original exists. A copy
+  into M's app made with `--machine M` is recorded on M too, so a migrate
+  started on M, or from a third machine, knows it: as a partial copy as
+  soon as the app names its space, then whole (or as the partial copy it
+  stopped at) when the build ends. A run killed in the moment between the
+  app naming the space and M recording it leaves M without the copy, and
+  one killed after this machine records the whole copy but before M does
+  leaves M with the partial copy only; this machine knows the copy either
+  way. When M cannot record it, the copy stands and a warning names the
+  space and the command to run on M. The `--json` report lists
+  the run's warnings (`warnings`), and the dialog shows them. After the
+  TUI numbers its workspaces again (`restore --recreate` after a restart),
+  earlier copies still open are found by a terminal they share or by a
+  label only one workspace has, so no second copy is made; the plan says
+  which workspace id the copy had and, for a match by the label alone,
+  how to copy the workspace anyway. With
+  `--only`, only the named sources are read, and a workspace or space
+  that cannot be captured is a `skip` line ("cannot capture: ...") while
+  the others are copied. A copy into the app that fails
+  part way stays recorded until its space and terminals are closed, and
+  until then the plan skips that source as "partial copy S still open:
+  close it first". One into the TUI leaves
+  `rebuild-pending.json`, which pauses the TUI plugin's saves and restores
+  until it is acknowledged; the error prints the exact `recovery inspect`
+  and `recovery acknowledge` commands with the `--host herdr`,
+  `--config-dir`, `--state-dir` and `--socket` they need (to run on M for
+  `--machine M`); one into the app that timed out, or was stopped (Ctrl-C,
+  killed, the dialog's time limit), is a partial copy of what it had made,
+  recorded as each step was made, or, stopped before the app named its
+  space, is named with its time as one that may have left a space. A TUI workspace is recorded with its
+  terminal ids and label, so a workspace that later takes its id with
+  another label is planned as a copy that names the earlier one, not as
+  `unchanged`, while one restored after a TUI restart stays `unchanged`
+  with a note that it matches only by its label. Every copied command
+  starts through the user's login shell, so it finds programs on the login
+  PATH that herdr-core lacks, and the pane keeps its own shell when the
+  command ends or is stopped with Ctrl-C. A pane whose folder no longer
+  exists opens a shell in the home folder without its command, and the plan
+  names the folder. A space copied into two TUI sessions is recorded for
+  each. An unnamed app space takes the
+  window's name for it, else its folder's name.
+- `--host core save` and the core relaunch now record an idle shell pane's
+  cwd as the folder its shell is in, which herdr-core reads from the
+  foreground process, instead of the folder the terminal started in. Where
+  core cannot read it, or the folder it names is gone, the start folder is
+  used as before; a folder removed and made again at the same path counts
+  as there.
+- The app dialog gets a Migrate section: a machine picker and "Copy TUI
+  session here" / "Copy app spaces to TUI", each showing the plan before it
+  copies; "Copy N" copies only the sources that plan showed. herdr-revive
+  started from the dialog now also finds `herdr`, `hc` and `herdr-app` in
+  `~/.local/bin` and `~/.cargo/bin`.
+
 ## 0.2.1 — 2026-11-09 (prerelease)
 
 - `herdr-revive install` sets up the Herdr desktop app in one step: it

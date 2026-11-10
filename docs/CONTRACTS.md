@@ -294,3 +294,148 @@ configuration and an allowlist entry. Ordinary Program snapshots using a configu
 launcher basename are refused, including absolute/bare-path variants. A removed
 profile cannot silently become the canonical launcher. An ordinary canonical
 agent with no matching profile keeps its own executable.
+
+## Migration JSON
+
+`migrate --json` prints one report: `{"to": "app" | "tui", "machine": null |
+name, "lines": [...], "summary": {"create", "skip", "unchanged",
+"ratios_lost"}, "applied": [{"source", "created"}] | null, "tui_session":
+{"session", "workspaces": [...], "terminal_ids": {workspace: [...]},
+"labels": {workspace: label}, "spaces": [...]} | null, "warnings": [...]}`; `applied` is `null` when what was
+copied is unknown (another machine's result could not be read).
+`warnings` are sentences about what the run did not stop for: a pane the
+capture could not read in full, a command the source's policy turns into a
+shell, a TUI workspace the TUI did not list after the copy, a copy another
+machine could not record (with the command to record it there). Without
+`--json` they go to stderr, the plan's before it and the copy's after it; a
+report without the field has none.
+`tui_session` (`--to tui` only) is the TUI session copied into, its live
+workspace ids, and the ids of the planning machine's own app spaces
+(`spaces`; a plan without it has `null`, and then every recorded copy
+counts): `--to tui --machine M` reads it from M's plan to skip the
+spaces this machine's ledger records as copies of a TUI workspace of M that
+still exists, and then asks M to apply `--only` the remaining `create`
+sources; a matching ledger entry that shares no terminal and no label
+with the workspace, and matches no other workspace after a renumbering
+(see the ledger below), leaves the line a `create` with a note. A line
+is `{"machine", "source", "status": "create" | "skip" | "unchanged",
+"reason", "name", "tabs", "panes", "agents", "denied", "mod_blocks",
+"live_agents", "copy", "partial", "notes"}`; `notes` are sentences about
+earlier copies that may be this source's (a reused TUI workspace id, a run
+whose `herdr-app do` timed out), panes whose folder is gone, and, for a
+`--to tui` copy, its agents that keep running in the app (`live_agents`
+lists the TUI's for `--to app` only). Readers ignore unknown fields; a report
+without `notes` or `terminal_ids` has none.
+
+`migrate --export tui` (hidden, read-only) prints `{"tool", "schema",
+"session", "snapshot", "launches", "live_agents", "denied", "tui_copies",
+"terminal_ids", "missing_folders", "app_copies", "partial_copies",
+"uncaptured", "warnings", "live_workspaces"}`:
+the schema-1 snapshot of the TUI session, each pane's launch `{"cwd", "argv"
+| null}` under that machine's `allowed_programs`, the panes whose agent
+still runs, the panes whose command the policy denied, and the
+workspaces of the exported session that machine's `--to tui` made, all of
+them (a renumbered TUI may have given any of them another id), `[{"space", "session",
+"workspace_id", "terminal_ids", "label", "at"}]` from its ledger (read without the
+lock; `space` is the id in that machine's core document, without a machine
+prefix; an export without the field has none), and each exported
+workspace's terminal ids, `{workspace: [...]}` (an export without it has
+none, so its workspaces cannot be matched to earlier copies), and the
+panes whose folder is gone on that machine, `{pane: folder}` (the folder
+without Linux's ` (deleted)` mark; one made again at that path is not
+gone), whose launch is then a shell in its home folder (an export without
+it has none), and the full `to_app` copies of the exported session in
+that machine's ledger, all of them as well, `[{"workspace_id", "space", "terminal_ids",
+"label", "at"}]` (`space` is its bare id there; an export without it has
+none), the partial ones, `[{"workspace_id", "created": {"space",
+"terminals", "unknown"}, "terminal_ids", "label", "at"}]` (bare ids; an
+export without it has none), the selected workspaces the capture could
+not read, `[{"workspace_id", "label", "reason"}]`, which the plan shows as
+`skip` lines with the reason "cannot capture: <reason>" (an export without
+it has none), and the capture's and the policy's `warnings` for the report
+of the machine that plans, and every live workspace of the session,
+`[{"workspace_id", "label", "terminal_ids"}]`, the exported ones or not,
+so the copies can be matched after a renumbering (an export without it
+knows only its exported workspaces). Another machine's `migrate --to app --machine`
+reads it through `hc exec` and skips a workspace whose space it lists as
+`<machine>/<space>`, or plans one as `unchanged` whose copy that machine
+records and its app still lists.
+
+`migrate --record ENTRY [--partial]` (hidden) stores ENTRY, a `to_app`
+ledger entry as JSON with `source.machine` `null`, in this machine's
+ledger: as a copy (it needs a `created.space`), or with `--partial` as a
+copy that stopped part way. `migrate --to app --machine M` runs it on M
+through `hc exec` with `--partial` once per space as soon as `space.new`
+names it (the build in progress, `"unknown": true`, under the run's `at`),
+then without `--partial` after the space is built, or with `--partial`
+after one that stops, with M's bare space and terminal ids, so M's own
+migrations, and a third machine's through the export, know the copy. A
+partial record replaces M's earlier one with the same source and `at`; a
+whole copy drops it. A run killed between `space.new` and the first
+record, or between this machine's record of the whole copy and M's, leaves
+M without the copy or with the partial copy only. It
+takes no `--machine`, `--to`, `--export`, `--dry-run`, `--yes`, `--json`,
+`--only` or `--session`, and `--partial` goes with it only.
+
+`~/.local/state/herdr-revive/migrated.json` is `{"tool", "schema": 1,
+"entries": [...], "partial": [...]}`; an entry is `{"direction": "to_app",
+"source": {"machine", "session", "workspace_id", "terminal_ids", "label"},
+"created": {"space", "terminals"}, "at"}` or `{"direction": "to_tui",
+"source": {"space"}, "created": {"session", "workspace_id",
+"terminal_ids", "label"}, "at"}`. A `to_app` entry is replaced by a later
+copy of the same workspace (the same id of the same TUI session, and a
+shared terminal or the same label), and by a later record of the same
+space; a copy of another workspace that now has the id stays, as the TUI
+may have renumbered its workspaces. A `to_tui` entry is replaced by a
+later copy of the same space into the same TUI session, so a space copied
+into two sessions keeps an entry for each, and another space's copy given
+its workspace id later does not drop it. Where an older
+ledger holds several `to_tui` entries for one workspace id, the one whose
+terminals, else label, match the live workspace is its origin, the newest
+first. `partial` keeps every `to_app` copy that stopped part way, several
+per source (the same copy recorded again replaces itself); a full copy
+drops only a timed-out partial that names nothing and is the same
+workspace (the same entry, the same id with a shared terminal or label,
+or a shared terminal under any id), and `--to app --yes` also drops one
+its plan matched to the copied workspace as below; `--to app
+--yes` drops those of the machine it copies to whose space, or without
+one every terminal, the app no longer lists (another machine's spaces may
+be missing only because it is offline). A run that made nothing records
+no partial. While a source has a partial copy whose space or terminal the
+app still lists, in this ledger or, for `--machine M`, in M's export, the
+best-matching one (by terminals, then label, then the newest) decides: if
+it matches the live workspace, the line is `skip` with the reason
+"partial copy S still open: close it first" and the copy in `partial`;
+if not (another workspace took the id), the line stays `create` with a
+note naming it. `terminal_ids` and `label` (without the
+TUI's `[n] ` number) describe the TUI workspace when it was copied or made;
+either is `null` in entries from before it, and `terminal_ids` also when it
+could not be read. herdr reuses workspace ids after a restart, never
+terminal ids, and a restored workspace keeps its label, so an entry
+matches the live workspace with its id while one of its terminals is still
+in it or its non-empty label is unchanged; an entry with neither never
+matches there. When no entry matches the workspace under its id, the TUI
+may have renumbered its workspaces (a rebuild numbers them from 1 again):
+an entry of the same session whose id no live workspace has, or another
+live workspace has without matching it, is this workspace's when it shares
+one of its terminals (the newest such entry), else when its label is this
+workspace's, no other live workspace has that label and no other such
+entry of the same kind has it. Only entries whose copy still exists take
+part (the app space is still listed; for `--to tui --machine M`, among
+the `spaces` of M's plan), so a closed copy neither matches nor makes a
+label ambiguous. The line then says "matched an earlier copy C by
+terminal (was wN)", or, by the label alone, which a new workspace in the
+folder of a closed one also has, "matched an earlier copy C by label (was
+wN): if ..." with how to copy it anyway. This applies to copies, origins
+and partial copies in both directions, to the copies another machine's
+export lists, and to a timed-out partial that names nothing, whose note
+goes on the workspace it matches. An entry under the workspace's id that
+matches neither way is named in a note only when nothing else matched. A
+`partial` entry whose last `herdr-app do` timed out has `"created":
+{..., "unknown": true}`. A `--to app` run records such an entry before it
+builds each space, naming nothing, updates it (under the same `at`) with
+the space and terminals after each `herdr-app do`, and when the build ends
+replaces it with what it made, drops it when it made nothing, or drops it
+once the full copy is recorded. So a run stopped part way leaves what it
+had made, or, before the app named the space, an entry that names nothing; `at` is milliseconds since the epoch. Its `schema` is the
+ledger's own version and does not follow the snapshot schema.

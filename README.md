@@ -1,8 +1,33 @@
 # herdr-revive
 
-Bring your commands back after a Herdr restart. Save the programs, working
-directories, layouts and exact agent conversations in your panes, then restore
-them from retained snapshots or reusable named workspaces.
+**Reboot it. Crash it. Quit it. It all comes back.**
+
+After a reboot, a crash, or Herdr and herdr-core closing, the programs in
+your panes start again in their own folders: your SSH session, `top`, the dev
+server, the editor. Every agent picks up its exact conversation, even when you
+launch it through a wrapper such as `claude-local`. In the Herdr desktop app
+this happens before the pane's first prompt; in the herdr TUI, when the
+session comes back. Turn on `auto_save` and `auto_restore`, list the
+programs you want back in `allowed_programs`, and run the install step for
+the app or the TUI below. Linux and macOS.
+
+- **Fast where it counts.** In a matched benchmark against herdr-resurrect
+  (100 panes, median) saves ran 8.9x faster, event saves 67x faster, previews
+  21.8x faster, with 92.7% less memory per save; see
+  [Measured against herdr-resurrect](#measured-against-herdr-resurrect).
+- **No daemon.** A bash hook saves as programs start and end, and relaunches a
+  pane in about 10 ms on the desktop app.
+- **You stay in control.** Only allowlisted programs relaunch; snapshots are
+  kept, previewed and restored on your word, or named and reused as spaces.
+- **New in 0.3.0: move a session between the TUI and the app.**
+  `herdr-revive migrate --to app` turns a TUI session's workspaces into app
+  spaces, `--to tui` brings app spaces into the TUI, on this machine or any
+  machine you reach with `hc` (`--machine`). Tabs, splits, folders and
+  commands come along, agents resume, the source is never touched, and running
+  it twice copies nothing twice (overlapping runs on one machine included;
+  two machines must not migrate to or from the same machine at the same
+  time). See
+  [Moving between the TUI and the app](#moving-between-the-tui-and-the-app).
 
 An independent MIT-licensed Rust plugin by Su Kang Yin.
 Package/executable: `herdr-revive`; plugin: `cantona.herdr-revive`.
@@ -112,7 +137,7 @@ On macOS, install Xcode Command Line Tools (`xcode-select --install`) for the li
 Install the tagged source release; Herdr previews the manifest and builds it:
 
 ```sh
-herdr plugin install cantona/herdr-revive --ref v0.2.1
+herdr plugin install cantona/herdr-revive --ref v0.3.0
 herdr plugin config-dir cantona.herdr-revive
 ```
 
@@ -244,6 +269,7 @@ actions and events already pass `--host herdr`.
 | `space import NAME FILE [--mapping MAP.json]` | Import a native named snapshot without executing commands |
 | `recovery inspect` | Inspect pending restore/reconstruction evidence |
 | `recovery acknowledge ID` | Preserve evidence and unblock operations without retrying commands |
+| `migrate --to app\|tui [--machine M] [--session S] [--only ID...] [--dry-run\|--yes]` | Copy the TUI session's workspaces into the desktop app, or the app's spaces into a TUI session; the source is never changed |
 
 Manual restores are repeatable requests. Automatic startup/events share one
 claim per server boot and never recreate missing IDs. Missing panes/tabs inside
@@ -490,6 +516,132 @@ table only twice, not once per pane, so 100 panes cost little more than one.
 | `autosave --force`, 1 pane | 17.70 ms | 18.53 ms |
 | `save`, 100 panes | 22.61 ms | 23.83 ms |
 
+## Moving between the TUI and the app
+
+`migrate` copies the structure and commands of a herdr TUI session into
+Herdr desktop app spaces, or the app's spaces into a TUI session:
+workspaces or spaces with their names, tabs with their names, the split
+layout, each pane's cwd and its command. Agents come back resumed. The
+source is never changed and no live process moves.
+
+```sh
+herdr-revive migrate --to app            # TUI session -> app spaces; shows the plan, asks y/N
+herdr-revive migrate --to tui            # app spaces -> TUI workspaces
+herdr-revive migrate --to app --dry-run  # only print the plan
+```
+
+The plan has one line per source: `create`, `skip` with the reason, or
+`unchanged` when an earlier run already copied it and the copy still exists
+(`~/.local/state/herdr-revive/migrated.json` records each copy; it lives
+under `XDG_STATE_HOME` when that is set). A space copied into two TUI
+sessions is recorded once for each. A source that an earlier run made
+by copying the other way is `skip`ped as `copy of ...` while its original
+still exists, so a copy is never copied back. A TUI workspace is recorded
+with its terminal ids and its label as well as its id: herdr gives a closed
+workspace's id to a new one after the TUI server restarts, so a workspace
+counts as the one copied only while one of those terminals is still in it
+or its label (without the `[n] ` number) is unchanged. A workspace restored
+after a restart keeps its label, so it stays `unchanged`; one renamed
+without a restart keeps its terminals. A rebuild may also number the
+workspaces again (`restore --recreate` after a restart makes `w2` and `w3`
+into `w1` and `w2`): when the workspace under a recorded id is another one,
+the earlier copy is found by a terminal it shares, else by its label when
+no other live workspace has that label and no other copy still open does,
+and the line says so ("matched an earlier copy s1 by terminal (was w2)").
+A match by the label alone may also be a new workspace in the folder of a
+closed one, so its note says how to copy it anyway ("... by label (was
+w2): if this is another workspace, close s1 or rename this one"). A
+workspace with none of these is a
+`create` that names the earlier copy, so you can close that copy first or
+leave the source out with `--only`. Each line names the
+destination, the tab, pane and agent counts, commands the source's policy
+does not allow (`allowed_programs`, `resume_agents`, agent launchers; they
+open a shell), and the agents still running in the source (in the TUI
+for `--to app`, in the app for `--to tui`, where every copied agent is a
+running one): after the copy two processes resume the same session until
+you close one. As with `install`, `--yes` applies without asking,
+`--dry-run` only prints, and without a terminal and `--yes` nothing happens
+(exit 2). `--only ID...` limits the copy to the ids the plan prints, and
+only those are read. A workspace or space with a pane that cannot be
+captured is a `skip` line ("cannot capture: ..."), and the others are
+planned and copied as usual.
+`--json` prints the report and needs `--dry-run` or `--yes`; see
+[contracts](docs/CONTRACTS.md). The plan is computed in full before
+anything is created. Runs that overlap on one machine are safe,
+`--machine` runs started there included: each one holds this machine's
+migration ledger lock from before it lists the destination until it is
+done, so a second run waits (up to 2 s, then reports "another migration
+is running") and then sees the first one's copy. The lock is per machine:
+two machines must not migrate to or from the same machine at the same
+time (that machine's own `migrate`, or `--machine M` from two others),
+or both can copy one source; run those one after the other.
+
+- **TUI session:** `--session NAME` (from `herdr session list`); inside a TUI
+  pane the session it belongs to, else the default session. The session must
+  be running. `migrate` uses both hosts, so `--host` is refused.
+- **Commands:** every copied command starts through your login shell
+  (`$SHELL -l`; `sh -l` for a shell other than bash, zsh, dash, ksh, mksh
+  or fish), so it finds programs on the PATH your login profile sets:
+  herdr-core's PATH does not come from `~/.profile`, and a TUI server's
+  need not. When the command ends, or you stop it with Ctrl-C, the pane
+  keeps a shell. A pane whose folder no longer exists (a removed worktree, a
+  temporary folder) opens a shell in your home folder without its command,
+  which would run in the wrong place; the plan line says which folders. A
+  folder removed and made again at the same path counts as there.
+- **Into the app:** the Herdr app window must be open. Split sizes are not
+  copied: the app's splits come out even. A split pane changes into its own
+  cwd first. If a copy fails part way, the space and terminals it
+  made are left in place, and while the app still lists them the next plan
+  skips that source ("partial copy S still open: close it first"), so
+  neither `--yes` nor the dialog copies it twice; close them and it is a
+  `create` again. A workspace that only took the old one's id stays a
+  `create`, with a note naming the open partial copy. Each partial copy is
+  kept until it is closed, a later copy of the source included, so `--to
+  tui` still knows it is a copy; a run that made nothing records nothing. If the app did not answer in
+  time, or the run was stopped (Ctrl-C, killed, the dialog's time limit)
+  before the app named the space, the next plan says that the run at that
+  time may have left a space: check the app. A run stopped after that has
+  recorded the space and what it made so far, so it is a partial copy like
+  any other: skipped while open, and never copied back.
+- **Into the TUI:** the layout comes from the app's own document and is
+  rebuilt with `restore --recreate`'s journal, sizes included; mod panes are
+  left out. Spaces that belong to another machine are left out; copy those
+  with `--machine`. An unnamed space takes the name the app window shows
+  for it, or, with no window to ask, its folder's name (`~` for home). If a
+  rebuild stops part way it leaves
+  `rebuild-pending.json`, as `restore --recreate` does, and until that is
+  acknowledged the TUI plugin's own saves and restores are paused and the
+  next migrate stops. The error prints the two commands to run, in full:
+  `herdr-revive --host herdr --config-dir ... --state-dir ... --socket ...
+  recovery inspect`, then `... recovery acknowledge ID` (for `--machine M`,
+  marked "on M:": run them on M). From a plain shell those flags are
+  needed, because the paths come from the plugin environment otherwise.
+- **Another machine:** `--machine M` (from `hc machine ls`) copies between
+  M's TUI and M's app spaces; nothing moves between machines. M needs
+  herdr-revive 0.3.0 or newer and `herdr`; the plan says what is missing.
+  They are found on PATH, then in `~/.local/bin`, then in `~/.cargo/bin`.
+  `--socket`, `--config-dir`, `--state-dir` and `--herdr-bin` name paths on
+  this machine and are refused with `--machine`. A copy into M's app is
+  recorded on M as well as here, so a migrate started on M, or from a third
+  machine, knows it is a copy: as soon as the app names the space, M
+  records it as a partial copy (one `hc exec` per space, not per step), so
+  a run killed after that leaves M a partial copy as here, and when the
+  build ends M records the whole copy, or the partial copy it stopped at.
+  Not covered: a run killed between the app naming the space and M
+  recording it leaves M without it, and one killed after this machine
+  records the whole copy but before M does leaves M only the partial copy;
+  this machine still knows the copy. If M cannot record it (say M is
+  running its own migrate), the copy stands, and a warning names the space
+  and the command to run on M to record it: on stderr, in the `--json` report's
+  `warnings`, and in the dialog as a warning toast after "Copied N of M".
+- **Dialog:** the app dialog's Migrate section picks the machine and offers
+  "Copy TUI session here" and "Copy app spaces to TUI"; each shows the plan
+  first, and "Copy N" copies only the `create` sources that plan showed.
+  If a copy runs past the dialog's 600 s limit, the dialog says what that
+  means: a copy into another machine's TUI may still finish there (open the
+  plan again to see what was copied); a copy into the app stopped part way
+  (close what it left in the app before copying again).
+
 ## Layouts and command capture
 
 Snapshots preserve workspace/tab order and labels, nested split directions and
@@ -609,7 +761,7 @@ REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/migrate_integrati
 python3 tests/real_host.py
 REVIVE_BINARY="$PWD/target/release/herdr-revive" python3 tests/openssh.py
 python3 scripts/verify_install.py
-python3 scripts/verify_install.py --github-ref v0.2.1
+python3 scripts/verify_install.py --github-ref v0.3.0
 python3 scripts/benchmark.py --include-cli
 python3 scripts/benchmark_core.py --output docs/benchmarks/linux-core-$(date +%F).json  # Linux only
 python3 tests/benchmark_contracts.py

@@ -1,9 +1,20 @@
 # Herdr Revive
 
-A dialog, opened with `ctrl-alt-r` (`cmd-alt-r` on macOS), that shows what herdr-revive last saved
-from your herdr-core terminals, which of those programs the next core start
-would relaunch, and whether the shell hook and config are in place. Three
-buttons save now, relaunch idle panes now, or read the facts again.
+**Reboot it. Crash it. Quit it. It all comes back.** After a reboot, a
+crash, or Herdr and herdr-core closing, the programs on your allowlist start
+again in their own folders and every agent picks up its exact conversation,
+before the pane's first prompt. In a matched benchmark it saved 8.9x faster
+than herdr-resurrect (100 panes, median), with no daemon running. New in
+0.3.0: move a whole session between the herdr TUI and the desktop app, either
+way, on this machine or another reached with `hc`.
+
+A dialog, opened with `ctrl-alt-r` (`cmd-alt-r` on macOS), shows what
+herdr-revive last saved from your herdr-core terminals, which of those
+programs the next core start would relaunch, and whether the shell hook and
+config are in place; three buttons save now, relaunch idle panes now, or read
+the facts again. Its Migrate section copies the TUI session into the app or
+the app's spaces into the TUI: it shows the plan first, then copies tabs,
+splits, folders and commands, and agents resume their exact session.
 
 ![Herdr Revive](preview.png)
 
@@ -42,6 +53,33 @@ padding and 8px corners. Text is 13px.
   - **Recovery:** only when a relaunch stopped part way: a `blocked` line
     "A relaunch stopped in state <state>; saves and relaunches wait until it
     is acknowledged." and an "Acknowledge without retry" button.
+  - **Migrate:** between Recovery and Setup. A dim "Migrate" label, then one chip per machine ("This
+    computer" first; temporary machines left out; the chosen one filled with
+    `solid`), then two buttons, "Copy TUI session here" and "Copy app spaces
+    to TUI". A button runs `herdr-revive migrate --to app|tui --json
+    --dry-run` (plus `--machine` for another machine) and the section turns
+    into the plan: a heading, then one row per source with its tab, pane and
+    agent counts and `create`, `unchanged, copy <id>` or `skip: reason` on the right,
+    notes below a row in `blocked` (agents still live in the TUI, a copy that
+    stopped part way, the report's `notes`: an earlier copy under a reused
+    TUI workspace id, a run that may have left a space, a gone folder, the
+    copied agents still running in the app) or `dim` (commands that open a shell, mod panes left
+    out), a `dim` line that split sizes are not copied when copying into the
+    app, then "Cancel" and "Copy N" ("Nothing to copy" when there is nothing
+    to create). "Copy N" runs the same command with `--yes`, limited with
+    `--only` to the sources the plan showed, and toasts "Copied N of M."; if it stops, the toast says how many were copied before, unless
+    that is unknown (`applied` is `null`). When the app stops a copy at
+    the 600 s limit, a `warning` toast says, for a copy into M's TUI, "The
+    copy may still finish on M; open the plan again to see what was
+    copied.", and for a copy into the app, "The copy stopped part way.
+    Close what it left in the app before copying again, then open the plan
+    again." The report's `warnings` follow in
+    a `warning` toast either way, and the plan lists its own below the rows
+    (`blocked`, "Warning: ...").
+    While the dry run runs the section reads "Planning..." and while `--yes`
+    runs "Copying..." (both `muted`). A failed plan read or copy posts an
+    error toast ("herdr-revive migrate failed" or "migrate stopped"); a click
+    on "Nothing to copy" posts the info toast "Nothing to copy."
   - **Setup:** "Shell hook in <rc file>" with "installed" (`done`),
     "missing" or "update needed" (`blocked`, followed by the command
     `herdr-revive install`), or "unreadable" (`blocked`,
@@ -68,9 +106,10 @@ holds the session lock; or one of these error bodies:
   `unexpected argument '--host'` or `unrecognized subcommand` (a release from
   before the core host), then the same install lines and the error line in
   small `dim` text.
-- Any other nonzero exit, in `blocked`: the output's line starting with
-  `error:`, else its first three non-empty lines, else "herdr-revive exited
-  with code N".
+- Any other nonzero exit, in `blocked`: the output's last line starting
+  with `herdr-revive:` that is not `herdr-revive: warning:`, else its line
+  starting with `error:`, else its first three non-empty lines, else
+  "herdr-revive exited with code N".
 - "unreadable status output: <parse error>" when the output is not JSON.
 - A timeout or other `exec` rejection, shown as its message (for example
   "herdr-revive took longer than 30 s and was stopped").
@@ -84,10 +123,13 @@ holds the session lock; or one of these error bodies:
   while a command or a status read runs; clicks on any button are ignored
   until both the command and the status read after it finish. A command
   that exits nonzero posts an error toast titled "herdr-revive save failed"
-  (or restore, ack) with its `error:` line, else its first three non-empty
-  lines, else "exited with code N".
+  (or restore, ack) with its last `herdr-revive:` line that is not a
+  warning, else its `error:` line, else its first three non-empty lines,
+  else "exited with code N".
 - "Refresh" shows "Reading..." and runs status again; it too is ignored
   while a read or command runs.
+- Migrate never changes the source. The plan is read fresh on each click;
+  "Copy N" applies what the plan showed, after the binary plans again.
 - Buttons fade slightly on hover. The mod shows no agent statuses (working,
   blocked, done, idle); it only reports what herdr-revive returns.
 
