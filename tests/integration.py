@@ -707,6 +707,7 @@ int main(int argc, char **argv) {
         self.codex_picker(f)
         failed = f.run("autosave", "--force", ok=False)
         self.assertIn("metadata did not arrive", failed.stderr)
+        self.assertIn("previous snapshot retained", failed.stderr)
         self.assertEqual(path.read_bytes(), before)
 
     def test_new_codex_invocation_waits_for_conflicting_native_session(self):

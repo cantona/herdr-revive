@@ -4,9 +4,12 @@
 pub mod external;
 pub mod ledger;
 pub mod tree;
+pub mod tui;
 
 use crate::core::setup::{self, Confirm};
-use anyhow::{Result, bail};
+use crate::model::{Config, SCHEMA, Scope, Snapshot, TOOL};
+use crate::transport::Host;
+use anyhow::{Context, Result, bail};
 use ledger::AppCreated;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -416,6 +419,39 @@ fn finish(result: Result<()>, written: Result<()>) -> Result<()> {
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+/// Captures each workspace on its own, so a pane that cannot be captured
+/// stops only a copy that includes it, and the error names its workspace.
+pub fn capture_each(
+    host: &mut impl Host,
+    session: &str,
+    workspaces: &[String],
+    focused: Option<String>,
+    config: &Config,
+    what: &str,
+) -> Result<Snapshot> {
+    let mut panes = Vec::new();
+    let mut layout = Vec::new();
+    for id in workspaces {
+        let (part, _) = crate::capture::capture(host, session, Some(id), config)
+            .with_context(|| format!("cannot capture {what} {id} (--only can leave it out)"))?;
+        panes.extend(part.panes);
+        layout.extend(part.layout);
+    }
+    panes.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+    let snapshot = Snapshot {
+        tool: TOOL.into(),
+        schema: SCHEMA,
+        session: session.into(),
+        created_ms: crate::store::now_ms()?,
+        scope: Scope::Session,
+        panes,
+        layout,
+        focused_workspace_id: focused.filter(|id| workspaces.contains(id)),
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
 }
 
 #[cfg(test)]

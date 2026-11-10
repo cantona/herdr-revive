@@ -1614,6 +1614,16 @@ fn carry_unrelaunched(
     carried
 }
 
+/// A save that stops on late agent metadata leaves the last snapshot as it
+/// was, and says so.
+fn snapshot_retained(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<capture::MetadataTimeout>().is_some() {
+        error.context("previous snapshot retained")
+    } else {
+        error
+    }
+}
+
 fn save(
     host: &mut HostImpl,
     store: &Store,
@@ -1628,7 +1638,8 @@ fn save(
         store::validate_name(name)?;
     }
     let generation = platform::generation(socket)?;
-    let (mut snapshot, protected) = capture::capture(host, &store.session, workspace, config)?;
+    let (mut snapshot, protected) =
+        capture::capture(host, &store.session, workspace, config).map_err(snapshot_retained)?;
     // Checked again now that the process table has been read: a newer command
     // may have started in between and taken the hinted one's place. Its own
     // save follows; this one would pair the old hint with the new process.
@@ -2029,6 +2040,22 @@ fn import_space(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_save_stopped_by_late_agent_metadata_says_the_previous_snapshot_is_kept() {
+        let late =
+            anyhow::anyhow!("no session id").context(capture::MetadataTimeout("w1:p1".into()));
+        assert_eq!(
+            format!("{:#}", snapshot_retained(late)),
+            "previous snapshot retained: pane w1:p1: agent session metadata did not arrive: \
+             no session id"
+        );
+        let other = anyhow::anyhow!("pane changed while waiting for agent session metadata");
+        assert_eq!(
+            format!("{:#}", snapshot_retained(other)),
+            "pane changed while waiting for agent session metadata"
+        );
+    }
 
     fn one_pane(command: Option<CommandSpec>) -> Snapshot {
         Snapshot {
