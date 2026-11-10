@@ -105,6 +105,49 @@ pub enum Action {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Copy the TUI session into the desktop app, or the app's spaces into a TUI session.
+    Migrate {
+        /// Where the copy goes.
+        #[arg(
+            long,
+            value_enum,
+            required_unless_present_any = ["export", "record"],
+            conflicts_with_all = ["export", "record"]
+        )]
+        to: Option<crate::migrate::Side>,
+        /// Print the TUI capture as JSON for another machine's migrate; read-only.
+        #[arg(long, value_enum, hide = true, conflicts_with = "record")]
+        export: Option<crate::migrate::Side>,
+        /// Record a copy another machine made into this machine's app (a
+        /// ledger entry as JSON), as if it had been made here.
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = ["dry_run", "yes", "json", "only", "session"]
+        )]
+        record: Option<String>,
+        /// With `--record`: the copy stopped part way.
+        #[arg(long, hide = true)]
+        partial: bool,
+        /// A machine from `hc machine ls`; empty means this one.
+        #[arg(long)]
+        machine: Option<String>,
+        /// The TUI session (`herdr session list`); default: the ambient, else the default one.
+        #[arg(long)]
+        session: Option<String>,
+        /// Copy only these workspaces or spaces, by the ids the plan prints.
+        #[arg(long, num_args = 1.., action = clap::ArgAction::Append)]
+        only: Vec<String>,
+        /// Apply without asking.
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
+        /// Print the plan and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the plan, and what was made, as JSON (for the dialog).
+        #[arg(long)]
+        json: bool,
+    },
     /// One read-only JSON document: latest snapshot, relaunch plan, recovery, setup.
     Status,
 }
@@ -1100,6 +1143,89 @@ pub fn setup_request(
     Ok(Some(request))
 }
 
+/// `migrate` drives both hosts, so `main` runs it through `migrate::run`.
+/// Only the explicit flags are taken here: `migrate::tui::resolve` applies
+/// the environment where it means something, and `HERDR_REVIVE_HOST` picks
+/// one host, which migrate has no use for.
+pub fn migrate_request(cli: &Cli) -> Result<Option<crate::migrate::Request>> {
+    use crate::core::setup::Confirm;
+    use crate::migrate::{Mode, Request, Side, TuiArgs};
+    let Action::Migrate {
+        to,
+        export,
+        record,
+        partial,
+        machine,
+        session,
+        only,
+        yes,
+        dry_run,
+        json,
+    } = &cli.command
+    else {
+        return Ok(None);
+    };
+    ensure!(
+        cli.host.is_none(),
+        "migrate uses both hosts; it takes no --host"
+    );
+    ensure!(
+        session.is_none() || cli.socket.is_none(),
+        "--session and --socket both name the TUI server; pass one"
+    );
+    // clap drops `requires` once a conflicting `--to` is given.
+    ensure!(
+        !*partial || record.is_some(),
+        "--partial goes with --record only"
+    );
+    let mode = match (to, export, record) {
+        (Some(side), None, None) => Mode::To(*side),
+        (None, Some(Side::Tui), None) => Mode::ExportTui,
+        (None, Some(Side::App), None) => bail!("--export app is not supported"),
+        (None, None, Some(entry)) => Mode::Record {
+            entry: entry.clone(),
+            partial: *partial,
+        },
+        _ => bail!("pass --to app or --to tui"),
+    };
+    let machine = machine.clone().filter(|machine| !machine.is_empty());
+    let tui = TuiArgs {
+        session: session.clone(),
+        socket: cli.socket.clone(),
+        config_dir: cli.config_dir.clone(),
+        state_dir: cli.state_dir.clone(),
+        herdr_bin: cli.herdr_bin.clone(),
+    };
+    if let Some(machine) = &machine {
+        ensure!(
+            mode != Mode::ExportTui,
+            "--export runs on the machine it reads; it takes no --machine"
+        );
+        ensure!(
+            !matches!(mode, Mode::Record { .. }),
+            "--record runs on the machine whose app has the copy; it takes no --machine"
+        );
+        crate::migrate::remote::refuse_local_paths(machine, &tui)?;
+    }
+    ensure!(
+        !*json || *yes || *dry_run || mode == Mode::ExportTui,
+        "--json needs --dry-run or --yes"
+    );
+    let confirm = match (yes, dry_run) {
+        (_, true) => Confirm::DryRun,
+        (true, false) => Confirm::Yes,
+        (false, false) => Confirm::Ask,
+    };
+    Ok(Some(Request {
+        mode,
+        machine,
+        only: only.clone(),
+        confirm,
+        json: *json,
+        tui,
+    }))
+}
+
 pub fn run(cli: Cli) -> Result<Value> {
     if matches!(cli.command, Action::Timer { .. }) {
         return crate::timer::run(cli);
@@ -1115,6 +1241,9 @@ pub fn run(cli: Cli) -> Result<Value> {
         Action::Install { .. } | Action::Uninstall { .. }
     ) {
         bail!("install and uninstall print a plan and ask; run them through setup_request");
+    }
+    if matches!(cli.command, Action::Migrate { .. }) {
+        bail!("migrate drives both hosts; run it through migrate_request");
     }
     let kind = HostKind::resolve(cli.host, cli.explicit_paths())?;
     if kind == HostKind::Core
@@ -1230,7 +1359,8 @@ pub fn run(cli: Cli) -> Result<Value> {
         | Action::Timer { .. }
         | Action::Init { .. }
         | Action::Install { .. }
-        | Action::Uninstall { .. } => {
+        | Action::Uninstall { .. }
+        | Action::Migrate { .. } => {
             unreachable!()
         }
         Action::Restore {
@@ -2071,6 +2201,109 @@ mod tests {
             format!("{:#}", snapshot_retained(other)),
             "pane changed while waiting for agent session metadata"
         );
+    }
+
+    fn migrate_cli(args: &[&str]) -> Result<Option<crate::migrate::Request>> {
+        let cli = Cli::try_parse_from(["herdr-revive"].iter().chain(args))?;
+        migrate_request(&cli)
+    }
+
+    #[test]
+    fn migrate_request_takes_the_flags_as_given() {
+        use crate::core::setup::Confirm;
+        use crate::migrate::{Mode, Side, TuiArgs};
+        let request = migrate_cli(&[
+            "--config-dir",
+            "/c",
+            "migrate",
+            "--to",
+            "tui",
+            "--session",
+            "work",
+            "--only",
+            "s1",
+            "s2",
+            "--only",
+            "s3",
+            "--machine",
+            "",
+            "--dry-run",
+            "--json",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(request.mode, Mode::To(Side::Tui));
+        assert_eq!(request.machine, None);
+        assert_eq!(request.only, ["s1", "s2", "s3"]);
+        assert_eq!(request.confirm, Confirm::DryRun);
+        assert!(request.json);
+        assert_eq!(
+            request.tui,
+            TuiArgs {
+                session: Some("work".into()),
+                config_dir: Some("/c".into()),
+                ..TuiArgs::default()
+            }
+        );
+        let request = migrate_cli(&["migrate", "--to", "app", "--machine", "canix", "--yes"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.machine.as_deref(), Some("canix"));
+        assert_eq!(request.confirm, Confirm::Yes);
+        let request = migrate_cli(&["migrate", "--export", "tui", "--json"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.mode, Mode::ExportTui);
+        assert_eq!(request.confirm, Confirm::Ask);
+        assert!(migrate_cli(&["status"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_request_refuses_what_it_cannot_honour() {
+        for (args, message) in [
+            (
+                &["--host", "herdr", "migrate", "--to", "app"][..],
+                "takes no --host",
+            ),
+            (
+                &["migrate", "--to", "tui", "--json"],
+                "--json needs --dry-run or --yes",
+            ),
+            (
+                &["migrate", "--export", "app"],
+                "--export app is not supported",
+            ),
+            (
+                &["migrate", "--export", "tui", "--machine", "canix"],
+                "takes no --machine",
+            ),
+            (
+                &[
+                    "--herdr-bin",
+                    "/h",
+                    "migrate",
+                    "--to",
+                    "tui",
+                    "--machine",
+                    "m",
+                ],
+                "--herdr-bin names a path on this machine",
+            ),
+            (
+                &["--socket", "/s", "migrate", "--to", "app", "--session", "x"],
+                "pass one",
+            ),
+        ] {
+            let error = migrate_cli(args).unwrap_err().to_string();
+            assert!(error.contains(message), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn run_refuses_migrate() {
+        let cli = Cli::try_parse_from(["herdr-revive", "migrate", "--to", "app"]).unwrap();
+        let error = run(cli).unwrap_err().to_string();
+        assert!(error.contains("run it through migrate_request"), "{error}");
     }
 
     fn one_pane(command: Option<CommandSpec>) -> Snapshot {

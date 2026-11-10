@@ -36,10 +36,17 @@ impl Side {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
     To(Side),
     ExportTui,
+    /// A ledger entry, as JSON, for a copy another machine made into this
+    /// machine's app, and whether it stopped part way
+    /// (`remote::record_here`).
+    Record {
+        entry: String,
+        partial: bool,
+    },
 }
 
 /// The TUI side's overrides: the herdr host's global flags plus `--session`.
@@ -554,6 +561,54 @@ pub fn capture_each(
 /// The skip reason of a source that could not be captured.
 pub fn uncaptured_reason(reason: &str) -> String {
     format!("cannot capture: {reason}")
+}
+
+/// For a copy into the app, `herdr-app ls` is checked first, before the
+/// ledger lock: it is the cheapest precondition, needs no other machine, and
+/// names a closed app window even while another migration holds the lock.
+/// The listing the plan uses is read again once the lock is held.
+pub fn run(
+    request: &Request,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    errors: &mut dyn Write,
+    tty: bool,
+) -> Result<i32> {
+    match &request.mode {
+        Mode::Record { entry, partial } => {
+            remote::record_here(entry, *partial, &ledger::dir()?)?;
+            Ok(0)
+        }
+        Mode::ExportTui => {
+            let mut export = tui::export(&tui::resolve(&request.tui)?, &request.only)?;
+            let dir = ledger::dir()?;
+            export.tui_copies = tui::tui_copies(&ledger::read(&dir)?, &export);
+            export.app_copies = tui::app_copies(&ledger::read_copies(&dir)?, &export);
+            export.partial_copies = tui::partial_copies(&ledger::read_partials(&dir)?, &export);
+            serde_json::to_writer(&mut *output, &export)?;
+            writeln!(output)?;
+            output.flush()?;
+            Ok(0)
+        }
+        Mode::To(Side::App) => {
+            // Only whether the window is open; nothing is planned from it.
+            external::app_ls()?;
+            // The plan compares the ledger with the listing, so the listing
+            // is read under the lock: a run that overlaps this one must not
+            // record a copy the listing has not seen yet.
+            let ledger = ledger::Ledger::open(&ledger::dir()?)?;
+            let ls = external::app_ls()?;
+            let export = match request.machine.as_deref() {
+                None => tui::export(&tui::resolve(&request.tui)?, &request.only)?,
+                Some(machine) => remote::export_tui(machine, &request.tui, &request.only)?,
+            };
+            to_app::run(request, ledger, &ls, &export, input, output, errors, tty)
+        }
+        Mode::To(Side::Tui) => match request.machine.as_deref() {
+            None => to_tui::run(request, input, output, errors, tty),
+            Some(machine) => remote::run_to_tui(machine, request, input, output, errors, tty),
+        },
+    }
 }
 
 #[cfg(test)]
