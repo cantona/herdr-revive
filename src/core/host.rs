@@ -89,6 +89,11 @@ impl CoreHost {
             .call("terminal.get", json!({"terminal": address}))
     }
 
+    /// A layout document such as `herdr-app`'s spaces; `doc.get` only reads.
+    pub fn doc(&mut self, name: &str) -> Result<Value> {
+        self.client.call("doc.get", json!({"name": name}))
+    }
+
     fn record(&mut self, pane: &str) -> Result<Value> {
         let address = address_of(pane)?.to_string();
         self.terminal(&address)

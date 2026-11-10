@@ -126,7 +126,12 @@ impl Node {
         }
     }
 
-    fn launch_tree(&self, panes: &BTreeMap<&str, &SavedPane>, config: &Config) -> Result<Value> {
+    fn launch_tree(
+        &self,
+        panes: &BTreeMap<&str, &SavedPane>,
+        config: &Config,
+        start: Start,
+    ) -> Result<Value> {
         match self {
             Self::Pane { pane_id, label } => {
                 let pane = panes
@@ -139,7 +144,10 @@ impl Node {
                 if let Some(command) = &pane.command {
                     // Denied commands leave a fresh shell; the plan exposes that decision.
                     if let Ok(argv) = command.allowed_argv(config) {
-                        value["command"] = json!(argv);
+                        value["command"] = json!(match start {
+                            Start::Direct => argv,
+                            Start::LoginShell => platform::login_pane(&pane.cwd, &argv),
+                        });
                     }
                 }
                 Ok(value)
@@ -150,7 +158,7 @@ impl Node {
                 first,
                 second,
             } => Ok(json!({"type":"split", "direction":direction,
-                "ratio":ratio, "first":first.launch_tree(panes,config)?, "second":second.launch_tree(panes,config)?})),
+                "ratio":ratio, "first":first.launch_tree(panes,config,start)?, "second":second.launch_tree(panes,config,start)?})),
         }
     }
 }
@@ -393,6 +401,18 @@ fn mutate(
     Ok(result)
 }
 
+/// How `rebuild` starts a pane's saved command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    /// As the TUI runs it: spawned, or typed into the pane's shell.
+    Direct,
+    /// Through the user's login shell: a migrated command comes from another
+    /// server's environment and may need the login PATH. A spawned pane
+    /// keeps that shell (`platform::LOGIN_PANE`); one typed into the pane's
+    /// own shell does not need to (`platform::LOGIN_RUN`).
+    LoginShell,
+}
+
 pub fn rebuild(
     host: &mut impl Host,
     store: &Store,
@@ -400,6 +420,7 @@ pub fn rebuild(
     config_dir: &Path,
     snapshot: &Snapshot,
     focus: bool,
+    start: Start,
 ) -> Result<Value> {
     crate::app::require_clear(store)?;
     let config = store::load_config(config_dir)?;
@@ -481,7 +502,7 @@ pub fn rebuild(
                 } else {
                     tab.root.first_leaf()
                 };
-                let root = initial.launch_tree(&panes, &config)?;
+                let root = initial.launch_tree(&panes, &config, start)?;
                 let mut params = json!({"tab_label":tab.label,"focus":false,"root":root});
                 if index == 0 {
                     params["tab_id"] = json!(initial_tab);
@@ -532,6 +553,7 @@ pub fn rebuild(
                         &launches,
                         &panes,
                         config_dir,
+                        start,
                     )?;
                     host.api("layout.export", json!({"tab_id":tab_id}), "layout_export")?
                 };
@@ -702,6 +724,7 @@ struct CreatedCommand {
     tab: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_splits(
     host: &mut impl Host,
     store: &Store,
@@ -710,6 +733,7 @@ fn launch_splits(
     launches: &[CreatedCommand],
     panes: &BTreeMap<&str, &SavedPane>,
     config_dir: &Path,
+    start: Start,
 ) -> Result<()> {
     if launches.is_empty() {
         return Ok(());
@@ -758,6 +782,11 @@ fn launch_splits(
             &live.terminal_id == terminal && &live.tab_id == tab && live.agent.is_none(),
             "created pane identity changed before command launch"
         );
+        // The pane's own shell stays, so the login shell need not.
+        let argv = match start {
+            Start::Direct => argv,
+            Start::LoginShell => platform::login_command(&argv),
+        };
         let text = platform::shell_command(&shell, &saved.cwd, &argv)?;
         mutate(
             host,
@@ -771,4 +800,69 @@ fn launch_splits(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_login_start_wraps_each_allowed_command_and_leaves_shells_and_denied_ones() {
+        let pane = |id: &str, argv: Option<Vec<&str>>| SavedPane {
+            workspace_id: "w1".into(),
+            tab_id: "w1:t1".into(),
+            pane_id: id.into(),
+            cwd: "/srv/a b".into(),
+            command: argv.map(|argv| CommandSpec::Program {
+                argv: argv.into_iter().map(String::from).collect(),
+            }),
+        };
+        let saved = [
+            pane("w1:p1", Some(vec!["ssh", "host"])),
+            pane("w1:p2", None),
+            pane("w1:p3", Some(vec!["htop"])),
+        ];
+        let panes: BTreeMap<&str, &SavedPane> =
+            saved.iter().map(|p| (p.pane_id.as_str(), p)).collect();
+        let leaf = |id: &str| {
+            Box::new(Node::Pane {
+                pane_id: id.into(),
+                label: None,
+            })
+        };
+        let tree = Node::Split {
+            direction: Direction::Right,
+            ratio: 0.5,
+            first: leaf("w1:p1"),
+            second: Box::new(Node::Split {
+                direction: Direction::Down,
+                ratio: 0.5,
+                first: leaf("w1:p2"),
+                second: leaf("w1:p3"),
+            }),
+        };
+        let config = Config {
+            allowed_programs: vec!["ssh".into()],
+            ..Config::default()
+        };
+        let direct = tree.launch_tree(&panes, &config, Start::Direct).unwrap();
+        assert_eq!(direct["first"]["command"], json!(["ssh", "host"]));
+        let login = tree
+            .launch_tree(&panes, &config, Start::LoginShell)
+            .unwrap();
+        assert_eq!(
+            login["first"],
+            json!({"type": "pane", "cwd": "/srv/a b",
+                   "command": ["sh", "-c", platform::LOGIN_PANE, "/srv/a b", "ssh", "host"]})
+        );
+        assert_eq!(
+            login["second"]["first"],
+            json!({"type": "pane", "cwd": "/srv/a b"})
+        );
+        assert_eq!(
+            login["second"]["second"],
+            json!({"type": "pane", "cwd": "/srv/a b"}),
+            "a denied command stays a shell"
+        );
+    }
 }
