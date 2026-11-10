@@ -3,7 +3,7 @@
 //! session list). Every call has a deadline.
 
 use crate::model::MAX_BYTES;
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Read;
@@ -21,6 +21,39 @@ impl Ran {
     pub fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr).trim().to_string()
     }
+}
+
+/// A program that did not finish in time: what it did is unknown.
+#[derive(Debug)]
+pub struct TimedOut {
+    program: String,
+    timeout: Duration,
+}
+
+impl TimedOut {
+    pub fn new(program: &str, timeout: Duration) -> Self {
+        Self {
+            program: program.into(),
+            timeout,
+        }
+    }
+}
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} did not finish within {} ms",
+            self.program,
+            self.timeout.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+pub fn timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<TimedOut>())
 }
 
 fn read_capped(pipe: impl Read) -> Result<Vec<u8>> {
@@ -45,7 +78,7 @@ pub fn run(program: &str, args: &[String], timeout: Duration) -> Result<Ran> {
     let stdout = drain(stdout);
     let stderr = drain(stderr);
     let deadline = Instant::now() + timeout;
-    let too_slow = || anyhow!("{program} did not finish within {} ms", timeout.as_millis());
+    let too_slow = || anyhow::Error::new(TimedOut::new(program, timeout));
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -121,10 +154,13 @@ pub struct AppTab {
     pub terminals: Vec<AppTerminal>,
 }
 
+/// `pane` is optional so that one odd entry cannot fail a whole listing;
+/// only a lookup that needs it fails.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppTerminal {
     pub terminal: String,
-    pub pane: String,
+    #[serde(default)]
+    pub pane: Option<String>,
 }
 
 /// `herdr-app ls` answers only while the window is open.
@@ -145,6 +181,9 @@ pub struct Made {
 
 pub trait AppDo {
     fn run(&mut self, command: &str, args: Value) -> Result<Made>;
+    /// `space.new` and `tab.new` report no pane, so a copy finds the pane
+    /// of the terminal they made here.
+    fn ls(&mut self) -> Result<AppLs>;
 }
 
 pub struct AppCli;
@@ -159,6 +198,10 @@ impl AppDo for AppCli {
         .with_context(|| format!("herdr-app do {command}"))?;
         serde_json::from_value(value)
             .with_context(|| format!("herdr-app do {command} printed an unexpected shape"))
+    }
+
+    fn ls(&mut self) -> Result<AppLs> {
+        app_ls()
     }
 }
 
@@ -249,6 +292,8 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("did not finish"));
+        assert!(timed_out(&error));
+        assert!(timed_out(&error.context("herdr-app do space.new")));
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
@@ -262,6 +307,7 @@ mod tests {
         .err()
         .unwrap();
         assert!(format!("{error:#}").contains("nope"));
+        assert!(!timed_out(&error));
         let error = run_json(
             "sh",
             &strings(&["-c", "echo not json"]),
@@ -374,9 +420,14 @@ mod tests {
             "terminals": [{"terminal": "t1", "pane": "p1", "status": null, "sub_agents": []}]}))
         .unwrap();
         assert_eq!(tab.terminals[0].terminal, "t1");
-        assert_eq!(tab.terminals[0].pane, "p1");
+        assert_eq!(tab.terminals[0].pane.as_deref(), Some("p1"));
         let bare: AppTab = serde_json::from_value(serde_json::json!({"id": "tb2"})).unwrap();
         assert!(bare.terminals.is_empty());
+        let odd: AppTab = serde_json::from_value(serde_json::json!({"id": "tb3",
+            "terminals": [{"terminal": "t2"}, {"terminal": "t3", "pane": null}]}))
+        .unwrap();
+        assert_eq!(odd.terminals[0].pane, None);
+        assert_eq!(odd.terminals[1].pane, None);
     }
 
     #[test]
