@@ -28,6 +28,17 @@ fn run() -> anyhow::Result<i32> {
             tty,
         );
     }
+    if let Some(request) = herdr_revive::app::migrate_request(&cli)? {
+        let stdin = std::io::stdin();
+        let tty = stdin.is_terminal() && std::io::stderr().is_terminal();
+        return herdr_revive::migrate::run(
+            &request,
+            &mut stdin.lock(),
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+            tty,
+        );
+    }
     let value = herdr_revive::app::run(cli)?;
     let mut output = BufWriter::new(std::io::stdout().lock());
     if let Some(text) = value
