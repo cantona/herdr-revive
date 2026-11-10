@@ -600,16 +600,21 @@ fn plan_rc(plan: &mut Plan, home: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn render_line(label: &str, item: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("  {label:<10} {item}: {reason}\n"),
+        None => format!("  {label:<10} {item}\n"),
+    }
+}
+
 pub fn render(plan: &Plan) -> String {
     let mut text = format!("herdr-revive {}:\n", plan.direction.name());
     for line in &plan.lines {
-        let label = line.change.label();
-        match &line.change {
-            Change::Skip(reason) => {
-                text.push_str(&format!("  {label:<10} {}: {reason}\n", line.item))
-            }
-            _ => text.push_str(&format!("  {label:<10} {}\n", line.item)),
-        }
+        let reason = match &line.change {
+            Change::Skip(reason) => Some(reason.as_str()),
+            _ => None,
+        };
+        text.push_str(&render_line(&line.change.label(), &line.item, reason));
     }
     text
 }
@@ -683,10 +688,48 @@ pub fn parse_yes(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Asks before applying, as `confirm` and `tty` allow. `None` means go
+/// ahead; `Some(code)` is the exit code to stop with: 0 for a dry run, 1
+/// declined, 2 not a terminal. The prompt goes to `errors`, so a piped
+/// stdout cannot swallow it; `tty` means both stdin and stderr are terminals.
+pub fn ask(
+    confirm: Confirm,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+    errors: &mut dyn Write,
+    tty: bool,
+) -> Result<Option<i32>> {
+    match confirm {
+        Confirm::DryRun => {
+            output.flush()?;
+            Ok(Some(0))
+        }
+        Confirm::Yes => Ok(None),
+        Confirm::Ask => {
+            if !tty {
+                output.flush()?;
+                writeln!(errors, "not a terminal: pass --yes to apply")?;
+                errors.flush()?;
+                return Ok(Some(2));
+            }
+            output.flush()?;
+            write!(errors, "Apply? [y/N] ")?;
+            errors.flush()?;
+            let mut answer = String::new();
+            input.read_line(&mut answer)?;
+            if parse_yes(&answer) {
+                Ok(None)
+            } else {
+                writeln!(output, "nothing changed")?;
+                output.flush()?;
+                Ok(Some(1))
+            }
+        }
+    }
+}
+
 /// Prints the plan and applies it as `confirm` and `tty` allow; the result
 /// is the exit code: 0 done or nothing to do, 1 declined, 2 not a terminal.
-/// The prompt goes to `errors`, so a piped stdout cannot swallow it; `tty`
-/// means both stdin and stderr are terminals.
 pub fn run(
     direction: Direction,
     confirm: Confirm,
@@ -703,30 +746,8 @@ pub fn run(
         output.flush()?;
         return Ok(0);
     }
-    match confirm {
-        Confirm::DryRun => {
-            output.flush()?;
-            return Ok(0);
-        }
-        Confirm::Yes => {}
-        Confirm::Ask => {
-            if !tty {
-                output.flush()?;
-                writeln!(errors, "not a terminal: pass --yes to apply")?;
-                errors.flush()?;
-                return Ok(2);
-            }
-            output.flush()?;
-            write!(errors, "Apply? [y/N] ")?;
-            errors.flush()?;
-            let mut answer = String::new();
-            input.read_line(&mut answer)?;
-            if !parse_yes(&answer) {
-                writeln!(output, "nothing changed")?;
-                output.flush()?;
-                return Ok(1);
-            }
-        }
+    if let Some(code) = ask(confirm, input, output, errors, tty)? {
+        return Ok(code);
     }
     for note in apply(&plan, &paths.home)? {
         writeln!(output, "{note}")?;
@@ -1440,5 +1461,41 @@ mod tests {
         );
         assert!(paths.mod_dir().join("main.js").exists());
         assert!(!install::rc_file(&paths.home).exists());
+    }
+
+    fn asked(confirm: Confirm, answer: &str, tty: bool) -> (Option<i32>, String, String) {
+        let mut input = answer.as_bytes();
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let code = ask(confirm, &mut input, &mut output, &mut errors, tty).unwrap();
+        (
+            code,
+            String::from_utf8(output).unwrap(),
+            String::from_utf8(errors).unwrap(),
+        )
+    }
+
+    #[test]
+    fn ask_follows_the_install_rules() {
+        assert_eq!(asked(Confirm::DryRun, "", true).0, Some(0));
+        assert_eq!(asked(Confirm::Yes, "", false).0, None);
+        let (code, _, errors) = asked(Confirm::Ask, "y\n", false);
+        assert_eq!(code, Some(2));
+        assert_eq!(errors, "not a terminal: pass --yes to apply\n");
+        let (code, _, errors) = asked(Confirm::Ask, "yes\n", true);
+        assert_eq!(code, None);
+        assert_eq!(errors, "Apply? [y/N] ");
+        let (code, output, _) = asked(Confirm::Ask, "\n", true);
+        assert_eq!(code, Some(1));
+        assert_eq!(output, "nothing changed\n");
+    }
+
+    #[test]
+    fn render_line_pads_the_label_and_appends_a_reason() {
+        assert_eq!(render_line("create", "w1", None), "  create     w1\n");
+        assert_eq!(
+            render_line("skip", "w2", Some("no panes")),
+            "  skip       w2: no panes\n"
+        );
     }
 }
