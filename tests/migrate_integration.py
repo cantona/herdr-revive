@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 """migrate between the fake TUI host of tests/integration.py, the fake core of
 tests/core_integration.py and a stand-in herdr-app that records every call.
 Nothing touches the real home, app, core or TUI."""

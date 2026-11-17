@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 """Warm costs of the herdr-core host against tests/core_integration.py's fake
 core, served from this process. Never starts, stops or contacts a real hc: every
 run gets a temporary HOME, XDG directories, socket and HC_SESSION. Linux only:

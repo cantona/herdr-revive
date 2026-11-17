@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 """Isolated Linux/macOS PTY/API tests. No real Herdr session is used."""
 import concurrent.futures
 import functools

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! Darwin process inspection. Unsafe code is confined to checked libproc/sysctl
 //! calls here; the rest of the crate continues to deny it.
 use super::{Process, decode_argv};

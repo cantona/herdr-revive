@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! `--machine M`: what M must have, and the parts of a migration that run
 //! on M through `hc exec`. The TUI capture for a copy into the app runs on
 //! M; a copy into M's TUI runs entirely on M, where its core and TUI are.

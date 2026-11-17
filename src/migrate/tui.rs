@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! The TUI side of a migration: which herdr server `--session` names, the
 //! plugin's directories outside the plugin, and the read-only capture a
 //! copy is made from. Nothing here saves a snapshot or changes the TUI.

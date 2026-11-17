@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::model::{ProcessInfo, validate_argv, validate_text};
 use anyhow::{Context, Result, ensure};
 use std::collections::HashMap;

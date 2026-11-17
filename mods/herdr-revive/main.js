@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 // herdr-revive: what the last snapshot holds, what the next core start
 // would relaunch, and whether the shell hook is in place. Every fact comes
 // from one `herdr-revive --host core status`; buttons run the matching

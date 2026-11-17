@@ -1,6 +1,6 @@
 # Third-party notices
 
-Generated from Cargo.lock for the Linux build, including build-time dependencies. Original herdr-revive code is MIT. Dependency licenses remain with their authors. The table records full upstream SPDX expressions; license texts are preserved below. Review again for any additional release target.
+Generated from Cargo.lock for the Linux build, including build-time dependencies. Original herdr-revive code is Apache-2.0. Dependency licenses remain with their authors. The table records full upstream SPDX expressions; license texts are preserved below. Review again for any additional release target.
 
 | Package | Version | Upstream license |
 | --- | --- | --- |

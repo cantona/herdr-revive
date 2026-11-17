@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 """PTY tests for the herdr-core host: a real interactive bash reads an rc file
 written by `install --yes`, and a fake core answers revive's JSON-RPC calls.
 Nothing touches the real home, config, state or herdr-core socket."""

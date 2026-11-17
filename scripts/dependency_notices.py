@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 """Regenerate license notices from the locked Linux dependency source packages."""
 import json
 from pathlib import Path
@@ -8,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1",
     "--locked", "--offline", "--filter-platform", "x86_64-unknown-linux-gnu"], cwd=ROOT))
 parts = ["# Third-party notices\n\nGenerated from Cargo.lock for the Linux build, including build-time dependencies. "
-         "Original herdr-revive code is MIT. Dependency licenses remain with their authors. "
+         "Original herdr-revive code is Apache-2.0. Dependency licenses remain with their authors. "
          "The table records full upstream SPDX expressions; license texts are preserved below. "
          "Review again for any additional release target.\n\n| Package | Version | Upstream license |\n| --- | --- | --- |\n"]
 packages = sorted((p for p in metadata["packages"] if p["source"]), key=lambda p: p["name"])

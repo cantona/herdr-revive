@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! migrate through the binary with stand-in `hc` and `herdr-app` scripts on
 //! PATH. Nothing reaches the real home, app, core or TUI.
 

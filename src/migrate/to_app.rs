@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! TUI -> app: one `space.new` per workspace (with its first tab), one
 //! `tab.new` per further tab, one `pane.split` per split, walked from the
 //! TUI's binary tree. Split sizes are not copied: the app's commands take

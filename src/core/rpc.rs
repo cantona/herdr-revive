@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::model::MAX_BYTES;
 use anyhow::{Context, Result, bail, ensure};
 use nix::errno::Errno;

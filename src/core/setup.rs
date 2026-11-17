@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! `install` and `uninstall` for the herdr-core host: the dialog mod, its
 //! `keys.json` bindings and the rc hook. The whole plan is computed before
 //! anything is written, so a bad `keys.json` or rc file changes nothing.

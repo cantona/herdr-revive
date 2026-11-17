@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 set -eu
 : "${HERDR_PLUGIN_ROOT:?Herdr must provide the plugin root}"
 revive_bin="$HERDR_PLUGIN_ROOT/target/release/herdr-revive"

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 """Benchmark native save/preview/events on private real Herdr mixed-pane hosts.
 
 Uses the matched benchmark's fixtures and exact saved-command assertions,

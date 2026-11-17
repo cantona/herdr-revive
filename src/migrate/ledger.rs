@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! `migrated.json` in the core state directory: which sources a migration
 //! copied and what it made, so a later run reports them `unchanged` while
 //! the copy exists. A copy that stopped part way is kept under `partial`

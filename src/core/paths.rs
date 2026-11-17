@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
 

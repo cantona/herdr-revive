@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::app::{Action, Cli};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};

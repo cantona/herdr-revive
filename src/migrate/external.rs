@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! The programs a migration drives, each by its bare name from PATH:
 //! `herdr-app` (the window), `hc` (other machines) and `herdr` (the TUI's
 //! session list). Every call has a deadline.

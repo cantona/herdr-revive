@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- herdr-revive is now licensed under the Apache License 2.0 instead of MIT.
+  Every source file carries `SPDX-FileCopyrightText` and
+  `SPDX-License-Identifier: Apache-2.0` lines.
+  Releases up to 0.3.0 remain available under MIT.
 - On the desktop app (`--host core`), a pane running a bare `claude` or
   `codex` no longer fails every save with "agent session metadata did not
   arrive" (#1). herdr-core reports no agent sessions, so for Claude, Revive

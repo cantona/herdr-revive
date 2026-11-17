@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! `migrate`: copy a herdr TUI session's workspaces into the desktop app, or
 //! the app's spaces into a TUI session. The source is never changed.
 

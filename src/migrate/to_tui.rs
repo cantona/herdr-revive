@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Su Kang Yin <paradyse@gmail.com>
+// SPDX-License-Identifier: Apache-2.0
+
 //! App -> TUI: each app space becomes a one-workspace `Snapshot` that
 //! `layout::rebuild` (the `restore --recreate` path and its journal)
 //! creates in the TUI. The app's layout document and terminals are only read.

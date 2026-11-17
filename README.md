@@ -29,7 +29,7 @@ the app or the TUI below. Linux and macOS.
   time). See
   [Moving between the TUI and the app](#moving-between-the-tui-and-the-app).
 
-An independent MIT-licensed Rust plugin by Su Kang Yin.
+An independent Apache-2.0-licensed Rust plugin by Su Kang Yin.
 Package/executable: `herdr-revive`; plugin: `cantona.herdr-revive`.
 **Supports Linux and macOS.** Windows remains planned.
 It also runs against the Herdr desktop app; see [Herdr desktop app](#herdr-desktop-app).
