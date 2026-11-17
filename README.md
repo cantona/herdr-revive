@@ -1,17 +1,22 @@
-# herdr-revive
+<h1 align="center">herdr-revive</h1>
 
-**Reboot it. Crash it. Quit it. It all comes back.**
+<p align="center"><b>Reboot it. Crash it. Quit it. It all comes back.</b></p>
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-![Platforms: Linux | macOS](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-lightgrey.svg)
-[![Release](https://img.shields.io/github/v/release/cantona/herdr-revive?include_prereleases)](https://github.com/cantona/herdr-revive/releases)
+<p align="center">
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+<img src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-lightgrey.svg" alt="Platforms: Linux | macOS">
+<a href="https://github.com/cantona/herdr-revive/releases"><img src="https://img.shields.io/github/v/release/cantona/herdr-revive?include_prereleases" alt="Release"></a>
+</p>
 
+<p align="center">
 Herdr brings back your layout after a restart. herdr-revive brings back
-**what was running in it**: the SSH session, `journalctl -f`, the dev server,
-`top`, and your coding agents, each on its exact conversation, in its own
-folder. It works in the herdr TUI and in the Herdr desktop app.
+<b>what was running in it</b>: the SSH session, <code>journalctl -f</code>, the
+dev server, <code>top</code>, and your coding agents, each on its exact
+conversation, in its own folder. It works in the herdr TUI and in the Herdr
+desktop app.
+</p>
 
-![The herdr-revive dialog in the Herdr desktop app](preview.png)
+<p align="center"><img src="preview.png" alt="The herdr-revive dialog in the Herdr desktop app" width="900"></p>
 
 ## Why you want it
 
