@@ -389,7 +389,9 @@ when its parent is not the pane's shell, and still prints the hook when core
 cannot be reached or the relaunch fails. `REVIVE_AUTO=0` in a pane's
 environment skips its relaunch, with a dim notice when there was something to
 relaunch. When another operation holds the session lock for longer than
-`timeout_ms` + `settle_ms` (at most 60 s), the relaunch is skipped with a dim
+`timeout_ms` + `settle_ms`, but at least 5.5 s (a save may spend 4 s of it
+waiting for Claude's session records) and at most 60 s, the relaunch is
+skipped with a dim
 notice naming `herdr-revive --host core restore --rehydrate`. Pending
 recovery evidence skips the relaunch of every app pane, with a dim notice
 naming `recovery acknowledge`, until it is acknowledged. `REVIVE_DEBUG=1`
@@ -447,8 +449,9 @@ snapshot, which panes the next core start would relaunch, any pending
 recovery, and whether the config and rc line are in place. Its buttons run
 `save`, `restore --rehydrate` and `recovery acknowledge`. `herdr-revive
 install` puts it in `~/.config/herdr-app/mods/herdr-revive` and binds it to
-`ctrl-alt-r` (`cmd-alt-r` on macOS), as in [keys.json](../keys.json). The app runs
-`herdr-revive` by name from its own `PATH`, which may lack `~/.cargo/bin`.
+`ctrl-alt-r` (`cmd-alt-r` on macOS), as in [keys.json](../keys.json). The dialog
+looks for `herdr-revive` on the app's `PATH`, then in `~/.local/bin` and
+`~/.cargo/bin`, which an app started from the desktop often lacks.
 herdr-app 0.1.13 stops a command after 30 s. [RECIPE.md](../RECIPE.md)
 describes the dialog in full.
 

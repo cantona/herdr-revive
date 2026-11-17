@@ -1356,7 +1356,7 @@ sleep 1"#,
             assert_eq!(with, without);
             assert_eq!(relaunched, without);
         } else {
-            // bash 3.2 resets PIPESTATUS in any DEBUG trap (README).
+            // bash 3.2 resets PIPESTATUS in any DEBUG trap (docs/GUIDE.md).
             let last = |lines: &[String]| -> Vec<String> {
                 lines
                     .iter()
