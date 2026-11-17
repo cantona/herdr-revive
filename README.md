@@ -79,7 +79,7 @@ back by themselves.
 ### herdr TUI
 
 ```sh
-herdr plugin install cantona/herdr-revive --ref v0.3.0
+herdr plugin install cantona/herdr-revive --ref v0.3.1
 herdr plugin config-dir cantona.herdr-revive    # put config.toml here
 ```
 

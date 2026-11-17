@@ -3,7 +3,7 @@
 What changed in each release of herdr-revive. Every release so far is a
 prerelease.
 
-## [Unreleased]
+## [0.3.1] - 2026-11-17
 
 ### Changed
 - herdr-revive is now licensed under the Apache License 2.0 instead of MIT.
@@ -296,7 +296,7 @@ This Linux prerelease includes automated runtime and installation checks.
 Power-loss qualification, full-session rollback observation, macOS and Windows
 remain follow-up work; see [validation](docs/VALIDATION.md).
 
-[Unreleased]: https://github.com/cantona/herdr-revive/compare/v0.3.0...HEAD
+[0.3.1]: https://github.com/cantona/herdr-revive/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/cantona/herdr-revive/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/cantona/herdr-revive/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/cantona/herdr-revive/compare/v0.1.6...v0.2.0

@@ -1,7 +1,7 @@
 # Release, migration and rollback
 
-Version 0.3.0 is a Linux and macOS prerelease of `cantona/herdr-revive`, licensed
-under MIT. It is built from source during installation. The manifest advertises
+Version 0.3.1 is a Linux and macOS prerelease of `cantona/herdr-revive`, licensed
+under Apache-2.0. It is built from source during installation. The manifest advertises
 both platforms. See [macOS and Linux regression validation](MACOS.md). Windows
 remains planned.
 
@@ -10,7 +10,7 @@ remains planned.
 Requires Rust/Cargo 1.97.1+, a C linker, Git, and Herdr 0.9.1 or newer.
 
 ```sh
-herdr plugin install cantona/herdr-revive --ref v0.3.0
+herdr plugin install cantona/herdr-revive --ref v0.3.1
 herdr plugin config-dir cantona.herdr-revive
 ```
 
