@@ -129,7 +129,8 @@ install and link time. A host method revive calls that a newer Herdr no longer
 offers fails the operation with an error (Herdr's details are redacted). A
 running agent whose session can be identified neither from Herdr's metadata nor
 from a resume ID on its command line fails the save and keeps the previous
-snapshot.
+snapshot on the TUI host; on the desktop app it is saved without a command
+(see [Layouts and command capture](#layouts-and-command-capture)).
 No Node or Python runtime is required. The popup uses POSIX `sh`, with optional
 `fzf` for saved-space selection. Python 3 is used only by development scripts.
 On macOS, install Xcode Command Line Tools (`xcode-select --install`) for the linker.
@@ -708,6 +709,22 @@ guess a latest session. Recognized Node package wrappers become canonical agent
 executables on PATH. Original launch flags are not inherited; use reviewed
 `agent_extra_args`. Latest-session, continuation and cwd guesses are refused.
 Unknown detected-agent wrappers fail capture.
+
+On the desktop app (`--host core`), herdr-core reports no agent sessions, so
+there is no native reference to wait for. For Claude, Revive reads Claude
+Code's own record of the running process, `sessions/<pid>.json` in its profile
+(`$CLAUDE_CONFIG_DIR`, else `~/.claude`). The record counts only when that very
+process wrote it. On Linux, its `procStart` must equal the process start time,
+its `pidDomain` must name this machine and pid namespace, and its `startedAt`
+must not be earlier than the start of this boot. A record that fails only that
+last check is reported, since a forward clock step causes it too. On macOS,
+its `startedAt` must not be earlier than the process start. Its
+session ID takes precedence over a `--resume` in the argv, which an in-session
+`/resume` leaves behind. Other agents need explicit resume arguments
+(`codex resume <uuid>`). An agent that still cannot be identified, such as a
+bare `codex`, is saved without a command and a warning names it. The other
+panes still save, and no session saved earlier in that pane is carried over to
+the new agent.
 
 ## Recovery and safety limits
 

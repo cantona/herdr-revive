@@ -284,6 +284,9 @@ impl Host for CoreHost {
     fn supports_layout(&self) -> bool {
         false
     }
+    fn reports_agent_sessions(&self) -> bool {
+        false
+    }
     fn snapshot(&mut self) -> Result<LiveSnapshot> {
         self.table = None;
         self.startup.clear();

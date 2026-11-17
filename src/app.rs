@@ -270,6 +270,12 @@ impl Host for HostImpl {
             Self::Core(host) => host.supports_layout(),
         }
     }
+    fn reports_agent_sessions(&self) -> bool {
+        match self {
+            Self::Herdr(host) => host.reports_agent_sessions(),
+            Self::Core(host) => host.reports_agent_sessions(),
+        }
+    }
     fn command_hint(&self, pane: &str) -> Option<String> {
         match self {
             Self::Herdr(host) => host.command_hint(pane),
@@ -337,11 +343,19 @@ pub fn socket_for(kind: HostKind, explicit: Option<PathBuf>) -> Result<(PathBuf,
     }
 }
 
+/// `timeout_ms + settle_ms`, but at least long enough to outlast a save that
+/// is waiting for Claude records (`capture::CLAUDE_RECORD_BUDGET`) with time
+/// left for its capture, and never more than a minute.
+pub fn lock_wait(config: &Config) -> std::time::Duration {
+    std::time::Duration::from_millis(config.timeout_ms + config.settle_ms)
+        .max(crate::capture::CLAUDE_RECORD_BUDGET + std::time::Duration::from_millis(1500))
+        .min(std::time::Duration::from_secs(60))
+}
+
 /// Hooks wait a bounded time for the session lock instead of skipping: an
 /// `init` that skipped would silently lose this pane's relaunch.
 pub fn wait_lock(store: &Store, config: &Config) -> Result<store::Lock> {
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_millis((config.timeout_ms + config.settle_ms).min(60_000));
+    let deadline = std::time::Instant::now() + lock_wait(config);
     let mut pause_ms = 5;
     loop {
         if let Some(lock) = store.try_lock()? {
@@ -1683,6 +1697,7 @@ fn retain_autosaved_commands(
     snapshot: &mut Snapshot,
     previous: &Snapshot,
     unproven: &std::collections::HashMap<String, capture::Running>,
+    unidentified: &std::collections::HashSet<String>,
 ) -> usize {
     let index: std::collections::HashMap<_, _> = previous
         .panes
@@ -1702,6 +1717,8 @@ fn retain_autosaved_commands(
             && matches!(old.command, Some(CommandSpec::Agent { .. }))
             // Capture saw a protected program there now, not the agent.
             && !unproven.contains_key(&pane.pane_id)
+            // Nor over a new agent whose session capture could not tell.
+            && !unidentified.contains(&pane.pane_id)
         {
             pane.command.clone_from(&old.command);
             retained += 1;
@@ -1814,7 +1831,12 @@ fn save(
             previous.session == store.session,
             "cross-session snapshot refused"
         );
-        retained_agents = retain_autosaved_commands(&mut snapshot, previous, &protected.unproven);
+        retained_agents = retain_autosaved_commands(
+            &mut snapshot,
+            previous,
+            &protected.unproven,
+            &protected.unidentified,
+        );
         if core_recovery && let HostImpl::Core(core) = host {
             let last: Option<SaveTime> = maybe_json(&store.root.join("last-save.json"))?;
             let handled = boot(store, &generation)?
@@ -2339,7 +2361,12 @@ mod tests {
         let previous = one_pane(program(&dd));
         let mut now = one_pane(None);
         assert_eq!(
-            retain_autosaved_commands(&mut now, &previous, &running([7, 1, 7, 9])),
+            retain_autosaved_commands(
+                &mut now,
+                &previous,
+                &running([7, 1, 7, 9]),
+                &Default::default()
+            ),
             0
         );
 
@@ -2356,14 +2383,36 @@ mod tests {
         });
         let mut now = one_pane(None);
         assert_eq!(
-            retain_autosaved_commands(&mut now, &one_pane(agent.clone()), &running([7, 1, 7, 9])),
+            retain_autosaved_commands(
+                &mut now,
+                &one_pane(agent.clone()),
+                &running([7, 1, 7, 9]),
+                &Default::default()
+            ),
             0
         );
         let mut now = one_pane(None);
         assert_eq!(
-            retain_autosaved_commands(&mut now, &one_pane(agent), &Default::default()),
+            retain_autosaved_commands(
+                &mut now,
+                &one_pane(agent.clone()),
+                &Default::default(),
+                &Default::default()
+            ),
             1
         );
+        // Nor over a new agent whose own session capture could not tell.
+        let mut now = one_pane(None);
+        assert_eq!(
+            retain_autosaved_commands(
+                &mut now,
+                &one_pane(agent),
+                &Default::default(),
+                &std::collections::HashSet::from(["w1:p1".to_string()])
+            ),
+            0
+        );
+        assert_eq!(now.panes[0].command, None);
 
         // Nor does a command by name (macOS); a proof does, but only for
         // the process it was made for.
@@ -2371,7 +2420,12 @@ mod tests {
         let mut now = one_pane(None);
         let named = running([7, 1, 7, 0]);
         assert_eq!(
-            retain_autosaved_commands(&mut now, &one_pane(program(&top)), &named),
+            retain_autosaved_commands(
+                &mut now,
+                &one_pane(program(&top)),
+                &named,
+                &Default::default()
+            ),
             0
         );
         let earlier = capture::Proven::from([(

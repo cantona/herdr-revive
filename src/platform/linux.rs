@@ -31,6 +31,25 @@ pub fn parse_stat(text: &str) -> Result<Process> {
     })
 }
 
+/// How long ago `process` started, on the kernel's clock since boot.
+pub fn process_age(process: &Process) -> Result<std::time::Duration> {
+    let ticks = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+        .context("clock tick rate unavailable")?
+        .context("clock tick rate unavailable")?;
+    ensure!(ticks > 0, "invalid clock tick rate");
+    let uptime: f64 = read_proc_text("/proc/uptime")
+        .context("uptime unavailable")?
+        .split_whitespace()
+        .next()
+        .context("invalid /proc/uptime")?
+        .parse()
+        .context("invalid /proc/uptime")?;
+    let started = process.start as f64 / ticks as f64;
+    Ok(std::time::Duration::from_secs_f64(
+        (uptime - started).max(0.0),
+    ))
+}
+
 pub fn process(pid: u32) -> Result<Process> {
     parse_stat(
         &read_proc_text(format!("/proc/{pid}/stat")).context("process identity unavailable")?,

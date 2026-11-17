@@ -42,6 +42,20 @@ fn bsd_info(id: u32) -> Result<libc::proc_bsdinfo> {
     Ok(info)
 }
 
+/// How long ago `process` started, on the wall clock (`start` is
+/// microseconds since the epoch).
+pub fn process_age(process: &Process) -> Result<std::time::Duration> {
+    ensure!(process.start != 0, "process start time unavailable");
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_micros(),
+    )?;
+    Ok(std::time::Duration::from_micros(
+        now.saturating_sub(process.start),
+    ))
+}
+
 pub fn process(id: u32) -> Result<Process> {
     let info = bsd_info(id)?;
     Ok(Process {

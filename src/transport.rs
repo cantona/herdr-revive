@@ -15,6 +15,11 @@ pub trait Host {
     fn supports_layout(&self) -> bool {
         true
     }
+    /// Whether panes can carry `agent_session` metadata. When they never do,
+    /// capture does not wait for it and asks the agent's own records instead.
+    fn reports_agent_sessions(&self) -> bool {
+        true
+    }
     /// The command line a hook typed into `pane`, when the host has one;
     /// capture uses it only for a foreground program it cannot inspect.
     fn command_hint(&self, _pane: &str) -> Option<String> {

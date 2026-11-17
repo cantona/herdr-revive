@@ -5,11 +5,15 @@ use anyhow::{Context, Result, ensure};
 use std::path::PathBuf;
 
 /// Panes whose foreground program is protected, by pane id, split by
-/// whether this capture proved the command it saved for them.
+/// whether this capture proved the command it saved for them; and agent
+/// panes saved without a command because no exact session could be found.
 #[derive(Debug, Default)]
 pub struct Protected {
     pub unproven: std::collections::HashMap<String, Running>,
     pub proven: Proven,
+    /// A new agent runs in each of these panes: an agent session saved there
+    /// earlier is not theirs, so `save` must not carry it over.
+    pub unidentified: std::collections::HashSet<String>,
 }
 
 /// Commands proven for protected processes, by pane id, kept between saves
@@ -80,8 +84,28 @@ fn attempts(
     warnings: &mut Vec<String>,
     keep_discarded: bool,
 ) -> Result<(Snapshot, Protected)> {
+    attempt_twice(
+        CLAUDE_RECORD_BUDGET,
+        warnings,
+        keep_discarded,
+        |warnings, record_until| {
+            capture_once(host, session, workspace, config, warnings, record_until)
+        },
+    )
+}
+
+/// Runs `once` and, when it discards its capture, once more. Both get the
+/// same deadline for record waits: a second attempt with its own would let
+/// a save hold the session lock for two.
+fn attempt_twice<T>(
+    budget: std::time::Duration,
+    warnings: &mut Vec<String>,
+    keep_discarded: bool,
+    mut once: impl FnMut(&mut Vec<String>, std::time::Instant) -> Result<Option<T>>,
+) -> Result<T> {
     let start = warnings.len();
-    if let Some(captured) = capture_once(host, session, workspace, config, warnings)? {
+    let record_until = std::time::Instant::now() + budget;
+    if let Some(captured) = once(warnings, record_until)? {
         return Ok(captured);
     }
     if !keep_discarded {
@@ -90,7 +114,7 @@ fn attempts(
     // A metadata wait can span unrelated pane/layout changes, and a program
     // can start between two process-table reads. Discard the first capture
     // and take a fresh process table and complete host view.
-    capture_once(host, session, workspace, config, warnings)?.context(
+    once(warnings, record_until)?.context(
         "panes kept changing during capture (agent metadata or a starting program); retry capture",
     )
 }
@@ -101,6 +125,7 @@ fn capture_once(
     workspace: Option<&str>,
     config: &Config,
     warnings: &mut Vec<String>,
+    record_until: std::time::Instant,
 ) -> Result<Option<(Snapshot, Protected)>> {
     let live = host.snapshot()?;
     crate::planner::index_live(&live)?;
@@ -306,8 +331,46 @@ fn capture_once(
                 }
                 Err(error) => return Err(error),
             };
+            // A session taken from Claude's record that the argv does not
+            // name may be one no message has made a transcript for yet (a
+            // bare start, or a /clear after --resume), so it is checked.
+            let mut unnamed_record = false;
             let (mut command, native_session, refreshed) = match &attached {
                 Some(resolved) => (command_for(resolved, None)?, false, false),
+                None if !host.reports_agent_sessions() => {
+                    match unreported_agent_command(
+                        identity,
+                        &argv,
+                        CLAUDE_RECORD_GRACE,
+                        record_until,
+                    )? {
+                        Unreported::Known {
+                            command,
+                            recorded,
+                            unnamed,
+                            note,
+                        } => {
+                            if let Some(note) = note {
+                                warnings.push(format!("pane {}: {note}", pane.pane_id));
+                            }
+                            unnamed_record = unnamed;
+                            (command, recorded, false)
+                        }
+                        Unreported::Unidentified(reason) => {
+                            // Waiting gains nothing here: no session metadata
+                            // ever arrives. The other panes still save.
+                            save_unidentified(
+                                pane,
+                                cwd,
+                                &reason,
+                                warnings,
+                                &mut protected_panes,
+                                &mut panes,
+                            );
+                            continue;
+                        }
+                    }
+                }
                 None => command_with_metadata_retry(host, pane, identity, &argv, &cwd, config)?,
             };
             if refreshed {
@@ -329,8 +392,8 @@ fn capture_once(
                     .filter(|launcher| launcher.agent == *agent)
                     .collect();
                 let detect_empty_claude = *agent == AgentKind::Claude
-                    && (native_session || attached.is_some())
-                    && !has_explicit_resume(&argv);
+                    && (((native_session || attached.is_some()) && !has_explicit_resume(&argv))
+                        || unnamed_record);
                 let environment = if !launchers.is_empty() || detect_empty_claude {
                     Some(platform::environment(identity)?)
                 } else {
@@ -343,46 +406,46 @@ fn capture_once(
                     *executable = launcher.executable.clone();
                 }
                 if detect_empty_claude {
-                    let (config_dir, home) = claude_profile(
-                        environment
-                            .as_deref()
-                            .context("Claude environment is unavailable")?,
-                    )?;
-                    // An attach can be typed in any directory, so its session's
-                    // transcript need not be under the pane's cwd project.
-                    let transcript_exists = if attached.is_some() {
-                        claude_transcript_exists(&config_dir, session_id)?
-                    } else {
-                        match claude_project_transcript_exists(
-                            &config_dir,
-                            std::path::Path::new(&cwd),
-                            session_id,
-                        )? {
-                            Some(exists) if exists || !has_implicit_resume(&argv) => exists,
-                            _ => claude_transcript_exists(&config_dir, session_id)?,
+                    // An attach can be typed in any directory, and a session
+                    // from Claude's record may be one `/resume` opened from
+                    // another project: look for either's transcript anywhere.
+                    let anywhere = attached.is_some() || unnamed_record;
+                    let profile = environment
+                        .as_deref()
+                        .context("Claude environment is unavailable")
+                        .and_then(|environment| {
+                            claude_create_profile(
+                                environment,
+                                config,
+                                executable,
+                                session_id,
+                                &cwd,
+                                &argv,
+                                anywhere,
+                            )
+                        });
+                    match profile {
+                        Ok(None) => {}
+                        Ok(Some((config_dir, home))) => {
+                            *session_mode = AgentSessionMode::Create;
+                            *saved_claude_config_dir = Some(config_dir);
+                            *saved_claude_home = home;
                         }
-                    };
-                    if !transcript_exists {
-                        let (configured_dir, configured_home) =
-                            configured_claude_profile(config, executable)?;
-                        ensure!(
-                            config_dir == configured_dir && home == configured_home,
-                            "Claude configuration profile cannot be reproduced; select the launcher with CLAUDE_CONFIG_DIR"
-                        );
-                        *session_mode = AgentSessionMode::Create;
-                        *saved_claude_config_dir = Some(
-                            config_dir
-                                .to_str()
-                                .context("non-UTF-8 Claude configuration path")?
-                                .into(),
-                        );
-                        *saved_claude_home = home
-                            .map(|home| {
-                                home.into_os_string()
-                                    .into_string()
-                                    .map_err(|_| anyhow::anyhow!("non-UTF-8 Claude HOME"))
-                            })
-                            .transpose()?;
+                        // On herdr-core no metadata will settle this later;
+                        // one pane cannot stop the others from saving.
+                        Err(error) if !host.reports_agent_sessions() => {
+                            let reason = format!("claude session {session_id}: {error:#}");
+                            save_unidentified(
+                                pane,
+                                cwd,
+                                &reason,
+                                warnings,
+                                &mut protected_panes,
+                                &mut panes,
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
             }
@@ -996,20 +1059,7 @@ pub fn command_for(argv: &[String], native: Option<&AgentSession>) -> Result<Opt
             let start = if is_launcher(&argv[0]) { 2 } else { 1 };
             explicit_resume_id(agent, &argv[start..])?
         };
-        validate_session_id(&session_id)?;
-        return Ok(Some(CommandSpec::Agent {
-            executable: if is_launcher(&argv[0]) {
-                agent.executable().into()
-            } else {
-                argv[0].clone()
-            },
-            agent,
-            session_id,
-            session_mode: AgentSessionMode::Resume,
-            claude_config_dir: None,
-            claude_home: None,
-            null_stdio: [false; 3],
-        }));
+        return agent_command(argv, agent, session_id).map(Some);
     }
     // Never turn an unrelated foreground process into a stale stored agent session.
     let command = CommandSpec::Program {
@@ -1017,6 +1067,372 @@ pub fn command_for(argv: &[String], native: Option<&AgentSession>) -> Result<Opt
     };
     command.argv()?;
     Ok(Some(command))
+}
+
+/// The profile a Claude session must be created in on restore because no
+/// message has written its transcript yet, or `None` when it resumes.
+fn claude_create_profile(
+    environment: &[u8],
+    config: &Config,
+    executable: &str,
+    session_id: &str,
+    cwd: &str,
+    argv: &[String],
+    anywhere: bool,
+) -> Result<Option<(String, Option<String>)>> {
+    let (config_dir, home) = claude_profile(environment)?;
+    let transcript_exists = if anywhere {
+        claude_transcript_exists(&config_dir, session_id)?
+    } else {
+        match claude_project_transcript_exists(&config_dir, std::path::Path::new(cwd), session_id)?
+        {
+            Some(exists) if exists || !has_implicit_resume(argv) => exists,
+            _ => claude_transcript_exists(&config_dir, session_id)?,
+        }
+    };
+    if transcript_exists {
+        return Ok(None);
+    }
+    let (configured_dir, configured_home) = configured_claude_profile(config, executable)?;
+    ensure!(
+        config_dir == configured_dir && home == configured_home,
+        "Claude configuration profile cannot be reproduced; select the launcher with CLAUDE_CONFIG_DIR"
+    );
+    let config_dir = config_dir
+        .to_str()
+        .context("non-UTF-8 Claude configuration path")?
+        .to_string();
+    let home = home
+        .map(|home| {
+            home.into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("non-UTF-8 Claude HOME"))
+        })
+        .transpose()?;
+    Ok(Some((config_dir, home)))
+}
+
+/// Saves an agent pane whose session cannot be told exactly with its cwd and
+/// no command, and keeps any earlier agent session off it.
+fn save_unidentified(
+    pane: &LivePane,
+    cwd: String,
+    reason: &str,
+    warnings: &mut Vec<String>,
+    protected: &mut Protected,
+    panes: &mut Vec<SavedPane>,
+) {
+    warnings.push(format!(
+        "pane {}: {reason}; saved without a command",
+        pane.pane_id
+    ));
+    protected.unidentified.insert(pane.pane_id.clone());
+    panes.push(SavedPane {
+        workspace_id: pane.workspace_id.clone(),
+        tab_id: pane.tab_id.clone(),
+        pane_id: pane.pane_id.clone(),
+        cwd,
+        command: None,
+    });
+}
+
+fn agent_command(argv: &[String], agent: AgentKind, session_id: String) -> Result<CommandSpec> {
+    validate_session_id(&session_id)?;
+    Ok(CommandSpec::Agent {
+        executable: if is_launcher(&argv[0]) {
+            agent.executable().into()
+        } else {
+            argv[0].clone()
+        },
+        agent,
+        session_id,
+        session_mode: AgentSessionMode::Resume,
+        claude_config_dir: None,
+        claude_home: None,
+        null_stdio: [false; 3],
+    })
+}
+
+/// The command of a pane on a host that never reports agent sessions
+/// (herdr-core), or why its agent's session cannot be told exactly.
+enum Unreported {
+    Known {
+        command: Option<CommandSpec>,
+        /// The session came from the agent's own record of the process.
+        recorded: bool,
+        /// That recorded session is not the one the argv names.
+        unnamed: bool,
+        /// Why the record could not be used, when the argv decided instead.
+        note: Option<String>,
+    },
+    Unidentified(String),
+}
+
+/// Claude's own record names the session the process has open now, so it
+/// wins over a `--resume` in its argv, which an in-session `/resume` leaves
+/// behind, as herdr's metadata does on the TUI host.
+fn unreported_agent_command(
+    identity: &platform::Process,
+    argv: &[String],
+    grace: std::time::Duration,
+    until: std::time::Instant,
+) -> Result<Unreported> {
+    let Some(agent) = agent_launcher(argv) else {
+        return Ok(Unreported::Known {
+            command: command_for(argv, None)?,
+            recorded: false,
+            unnamed: false,
+            note: None,
+        });
+    };
+    let from_argv = command_for(argv, None);
+    // An argv that names the session needs no wait for the record, which
+    // would only confirm or update it.
+    let grace = if matches!(from_argv, Ok(Some(CommandSpec::Agent { .. }))) {
+        std::time::Duration::ZERO
+    } else {
+        grace
+    };
+    let recorded = if agent == AgentKind::Claude {
+        claude_recorded_session_waiting(identity, grace, until)
+    } else {
+        Ok(None)
+    };
+    if let Ok(Some(session_id)) = recorded {
+        let unnamed = !matches!(
+            &from_argv,
+            Ok(Some(CommandSpec::Agent { session_id: named, .. })) if *named == session_id
+        );
+        return Ok(Unreported::Known {
+            command: Some(agent_command(argv, agent, session_id)?),
+            recorded: true,
+            unnamed,
+            note: None,
+        });
+    }
+    Ok(match from_argv {
+        Ok(command) => Unreported::Known {
+            command,
+            recorded: false,
+            unnamed: false,
+            note: recorded.err().map(|error| {
+                format!(
+                    "Claude's session record unused: {error:#}; saved the session its argv names"
+                )
+            }),
+        },
+        Err(error) => Unreported::Unidentified(match recorded {
+            Err(record) => format!(
+                "{} session not identified: {error:#}; Claude's session record: {record:#}",
+                agent.name()
+            ),
+            Ok(_) => format!("{} session not identified: {error:#}", agent.name()),
+        }),
+    })
+}
+
+/// The fields revive reads from Claude Code's `<config>/sessions/<pid>.json`.
+#[derive(serde::Deserialize)]
+struct ClaudeSessionRecord {
+    pid: u32,
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(rename = "startedAt", default)]
+    started_at: Option<u64>,
+    #[serde(rename = "procStart", default)]
+    proc_start: Option<String>,
+    /// `linux:<machine id>:pid:[<pid namespace>]`: the machine and pid
+    /// namespace the pid belongs to. It does not tell boots apart.
+    #[serde(rename = "pidDomain", default)]
+    pid_domain: Option<String>,
+}
+
+/// How the writer of a session record is told apart on this platform.
+enum Writer<'a> {
+    /// The process's pid domain as Claude writes it (`None` when the machine
+    /// id cannot be read).
+    Linux {
+        domain: Option<&'a str>,
+    },
+    Macos,
+}
+
+/// Whether `process` wrote the record, rather than an earlier process that
+/// had the same pid and left its record behind.
+fn record_written_by(
+    process: &platform::Process,
+    record: &ClaudeSessionRecord,
+    writer: &Writer,
+) -> bool {
+    if record.pid != process.pid {
+        return false;
+    }
+    match writer {
+        // procStart is the start time field of /proc/<pid>/stat, as `start`
+        // is. It counts clock ticks since boot, so a record from an earlier
+        // boot can match it too: `claude_recorded_session` checks the boot.
+        // pidDomain names the machine and pid namespace.
+        Writer::Linux { domain } => {
+            record.proc_start.as_deref() == Some(process.start.to_string().as_str())
+                && match (record.pid_domain.as_deref(), domain) {
+                    (Some(written), Some(domain)) => written == *domain,
+                    _ => true,
+                }
+        }
+        // `start` is microseconds since the epoch, `startedAt` milliseconds,
+        // taken once the process runs; an earlier process wrote before this
+        // one started.
+        Writer::Macos => {
+            process.start != 0
+                && record.started_at.is_some_and(|started| {
+                    started.saturating_mul(1000).saturating_add(999) >= process.start
+                })
+        }
+    }
+}
+
+/// The pid domain Claude writes on Linux for process `pid`:
+/// `linux:<machine id>:pid:[<pid namespace>]`; `None` without a machine id.
+fn linux_pid_domain(pid: u32) -> Result<Option<String>> {
+    let Ok(machine) = std::fs::read_to_string("/etc/machine-id") else {
+        return Ok(None);
+    };
+    let namespace = std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+        .with_context(|| format!("cannot read the pid namespace of {pid}"))?;
+    Ok(Some(format!(
+        "linux:{}:{}",
+        machine.trim(),
+        namespace.to_string_lossy()
+    )))
+}
+
+/// When this boot began, in ms since the epoch (`btime` in /proc/stat).
+fn linux_boot_ms() -> Result<u64> {
+    let stat = std::fs::read_to_string("/proc/stat").context("cannot read /proc/stat")?;
+    let seconds: u64 = stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .context("/proc/stat has no btime")?
+        .trim()
+        .parse()
+        .context("/proc/stat btime is not a number")?;
+    Ok(seconds.saturating_mul(1000))
+}
+
+/// Claude writes its record a second or more after it starts (1.3 to 3.3 s
+/// on Linux, measured), later than the hook's save of the command that
+/// started it. A save that missed it would keep no session, and a quiet
+/// pane makes no later save.
+const CLAUDE_RECORD_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long one save may wait for Claude records in all, across its panes
+/// and both capture attempts. A save made 0.5 s after Claude starts thus
+/// covers a record written up to 4.5 s in. The save holds the session lock
+/// meanwhile; `app::wait_lock` waits longer than this for it.
+pub const CLAUDE_RECORD_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// A record Claude may be about to replace: one not yet whole, or one left
+/// by an earlier boot. A wait reads it again; other errors end it.
+#[derive(Debug)]
+struct RecordNotReady(String);
+
+impl std::fmt::Display for RecordNotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RecordNotReady {}
+
+/// `claude_recorded_session`, waiting until the process is `grace` old, but
+/// not past `until`, for a record it may still be about to write. An older
+/// process without one is not waited for: Claude before 2.1.319 may write
+/// none.
+fn claude_recorded_session_waiting(
+    identity: &platform::Process,
+    grace: std::time::Duration,
+    until: std::time::Instant,
+) -> Result<Option<String>> {
+    // Fixed once: the age need not advance (a /proc/uptime virtualised in a
+    // container, a wall clock stepped back on macOS), the deadline does.
+    let deadline = (std::time::Instant::now()
+        + grace.saturating_sub(platform::process_age(identity)?))
+    .min(until);
+    loop {
+        let recorded = claude_recorded_session(identity);
+        let pending = match &recorded {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(error) => error.downcast_ref::<RecordNotReady>().is_some(),
+        };
+        if !pending || std::time::Instant::now() >= deadline {
+            return recorded;
+        }
+        ensure!(
+            platform::process(identity.pid)? == *identity,
+            "agent changed while waiting for its session record"
+        );
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(left.min(std::time::Duration::from_millis(100)));
+    }
+}
+
+/// The session a running Claude process has open, from its own record;
+/// `None` when it wrote none (an older Claude, or one not yet started).
+fn claude_recorded_session(identity: &platform::Process) -> Result<Option<String>> {
+    let (config_dir, _) = claude_profile(&platform::environment(identity)?)?;
+    let path = config_dir
+        .join("sessions")
+        .join(format!("{}.json", identity.pid));
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
+    let record: ClaudeSessionRecord = serde_json::from_slice(&crate::store::read_bytes(&path)?)
+        .map_err(|error| {
+            let message = format!("{} is not a Claude session record: {error}", path.display());
+            // Only a record cut short may still be completed; one that is
+            // whole but does not fit never will.
+            if error.classify() == serde_json::error::Category::Eof {
+                anyhow::Error::new(RecordNotReady(message))
+            } else {
+                anyhow::anyhow!(message)
+            }
+        })?;
+    let domain = if cfg!(target_os = "linux") {
+        linux_pid_domain(identity.pid)?
+    } else {
+        None
+    };
+    let writer = if cfg!(target_os = "linux") {
+        Writer::Linux {
+            domain: domain.as_deref(),
+        }
+    } else {
+        Writer::Macos
+    };
+    if !record_written_by(identity, &record, &writer) {
+        return Ok(None);
+    }
+    if cfg!(target_os = "linux")
+        && let Some(started) = record.started_at
+    {
+        // Not a quiet `None`: when the clock stepped forward after Claude
+        // started, a real record lands here, and the warning should say so.
+        let boot = linux_boot_ms()?;
+        if started < boot {
+            return Err(RecordNotReady(format!(
+                "{} was written at {started} ms, before this boot began ({boot} ms by the clock now): \
+                 left by an earlier boot, or the clock stepped forward since Claude started",
+                path.display()
+            ))
+            .into());
+        }
+    }
+    validate_session_id(&record.session_id)
+        .with_context(|| format!("{} names no exact session", path.display()))?;
+    Ok(Some(record.session_id))
 }
 
 pub fn explicit_resume_id(agent: AgentKind, args: &[String]) -> Result<String> {
@@ -1267,5 +1683,508 @@ mod tests {
             "sonnet",
             "--resume=id"
         ])));
+    }
+
+    use crate::model::CommandSpec;
+
+    fn owned(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    struct Child(std::process::Child);
+
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A sleeper whose environment can be read: macOS hides the environment
+    /// of its own platform binaries such as /bin/sleep, which Claude is not.
+    /// An ad-hoc signed copy is no platform binary.
+    fn sleeper(dir: &std::path::Path) -> std::path::PathBuf {
+        if !cfg!(target_os = "macos") {
+            return "sleep".into();
+        }
+        let copy = dir.join("sleep");
+        std::fs::copy("/bin/sleep", &copy).unwrap();
+        let signed = std::process::Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(signed.success(), "codesign failed for {}", copy.display());
+        copy
+    }
+
+    /// A live process whose environment names `config` as Claude's
+    /// configuration directory, as a running Claude's would.
+    fn claude_like(config: &std::path::Path) -> (Child, super::platform::Process) {
+        let child = std::process::Command::new(sleeper(config))
+            .arg("30")
+            .env_clear()
+            .env("CLAUDE_CONFIG_DIR", config)
+            .spawn()
+            .unwrap();
+        let process = super::platform::process(child.id()).unwrap();
+        (Child(child), process)
+    }
+
+    const UUID: &str = "3f2b8c1e-0000-4000-8000-000000000000";
+
+    fn write_record(config: &std::path::Path, process: &super::platform::Process, text: &str) {
+        std::fs::create_dir_all(config.join("sessions")).unwrap();
+        std::fs::write(
+            config
+                .join("sessions")
+                .join(format!("{}.json", process.pid)),
+            text,
+        )
+        .unwrap();
+    }
+
+    /// A record shaped like the ones Claude Code 2.1.327 writes, for
+    /// `process`: on Linux with the pidDomain it writes there.
+    fn own_record(process: &super::platform::Process) -> String {
+        let mut record = serde_json::json!({
+            "pid": process.pid,
+            "sessionId": UUID,
+            "cwd": "/",
+            "startedAt": crate::store::now_ms().unwrap(),
+            "procStart": process.start.to_string(),
+            "version": "2.1.327",
+            "kind": "interactive",
+            "entrypoint": "cli",
+            "status": "idle",
+        });
+        if cfg!(target_os = "linux") {
+            let machine = std::fs::read_to_string("/etc/machine-id").unwrap();
+            let namespace = std::fs::read_link(format!("/proc/{}/ns/pid", process.pid)).unwrap();
+            record["pidDomain"] = serde_json::json!(format!(
+                "linux:{}:{}",
+                machine.trim(),
+                namespace.to_string_lossy()
+            ));
+        }
+        record.to_string()
+    }
+
+    #[test]
+    fn a_session_record_counts_only_for_the_process_that_wrote_it() {
+        use super::{ClaudeSessionRecord, Writer, record_written_by};
+        let process = |start| super::platform::Process {
+            pid: 42,
+            parent: 1,
+            group: 42,
+            start,
+        };
+        let record =
+            |pid, started_at: Option<u64>, proc_start: Option<&str>, domain: Option<&str>| {
+                ClaudeSessionRecord {
+                    pid,
+                    session_id: UUID.into(),
+                    started_at,
+                    proc_start: proc_start.map(String::from),
+                    pid_domain: domain.map(String::from),
+                }
+            };
+        let domain = "linux:0123456789abcdef0123456789abcdef:pid:[4026531836]";
+        let here = Writer::Linux {
+            domain: Some(domain),
+        };
+        let linux =
+            |start, record: &ClaudeSessionRecord| record_written_by(&process(start), record, &here);
+        let after = Some(1_794_900_060_000);
+        assert!(linux(
+            76105459,
+            &record(42, after, Some("76105459"), Some(domain))
+        ));
+        assert!(linux(76105459, &record(42, None, Some("76105459"), None)));
+        assert!(!linux(
+            76105459,
+            &record(
+                42,
+                after,
+                Some("76105459"),
+                Some("linux:0000:pid:[4026531836]")
+            )
+        ));
+        assert!(!linux(
+            76105459,
+            &record(42, after, Some("76100000"), Some(domain))
+        ));
+        assert!(!linux(76105459, &record(42, after, None, Some(domain))));
+        assert!(!linux(
+            76105459,
+            &record(7, after, Some("76105459"), Some(domain))
+        ));
+        let no_machine_id = Writer::Linux { domain: None };
+        assert!(record_written_by(
+            &process(76105459),
+            &record(42, after, Some("76105459"), Some(domain)),
+            &no_machine_id
+        ));
+
+        let macos = |start, record: &ClaudeSessionRecord| {
+            record_written_by(&process(start), record, &Writer::Macos)
+        };
+        let started_us = 1_794_631_207_000_000;
+        assert!(macos(
+            started_us,
+            &record(42, Some(1_794_631_207_889), None, None)
+        ));
+        assert!(macos(
+            started_us + 500,
+            &record(42, Some(1_794_631_207_000), None, None)
+        ));
+        assert!(!macos(
+            started_us,
+            &record(42, Some(1_794_631_206_000), None, None)
+        ));
+        assert!(!macos(started_us, &record(42, None, None, None)));
+        assert!(!macos(0, &record(42, Some(1_794_631_207_889), None, None)));
+    }
+
+    #[test]
+    fn claudes_own_record_gives_the_session_of_that_very_process() {
+        let config = tempfile::tempdir().unwrap();
+        let config = config.path().canonicalize().unwrap();
+        let (_child, process) = claude_like(&config);
+        assert_eq!(super::claude_recorded_session(&process).unwrap(), None);
+
+        write_record(&config, &process, &own_record(&process));
+        assert_eq!(
+            super::claude_recorded_session(&process).unwrap().as_deref(),
+            Some(UUID)
+        );
+
+        let stale = serde_json::json!({"pid": process.pid, "sessionId": UUID,
+            "startedAt": 1, "procStart": "1"});
+        write_record(&config, &process, &stale.to_string());
+        assert_eq!(super::claude_recorded_session(&process).unwrap(), None);
+
+        if cfg!(target_os = "linux") {
+            let mut record: serde_json::Value =
+                serde_json::from_str(&own_record(&process)).unwrap();
+            record["pidDomain"] =
+                serde_json::json!("linux:00000000000000000000000000000000:pid:[1]");
+            write_record(&config, &process, &record.to_string());
+            assert_eq!(super::claude_recorded_session(&process).unwrap(), None);
+            let mut record: serde_json::Value =
+                serde_json::from_str(&own_record(&process)).unwrap();
+            record["startedAt"] = serde_json::json!(super::linux_boot_ms().unwrap() - 1);
+            write_record(&config, &process, &record.to_string());
+            let error = format!(
+                "{:#}",
+                super::claude_recorded_session(&process).unwrap_err()
+            );
+            assert!(
+                error.contains("before this boot began") && error.contains("clock stepped forward"),
+                "a record from an earlier boot with the same pid and start tick: {error}"
+            );
+        }
+
+        write_record(&config, &process, "{\"pid\": ");
+        assert!(super::claude_recorded_session(&process).is_err());
+    }
+
+    #[test]
+    fn a_young_claude_is_given_time_to_write_its_record() {
+        let config = tempfile::tempdir().unwrap();
+        let config = config.path().canonicalize().unwrap();
+        let (_child, process) = claude_like(&config);
+        let grace = std::time::Duration::from_secs(5);
+        let writer = {
+            let (config, process) = (config.clone(), process.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                write_record(&config, &process, &own_record(&process));
+            })
+        };
+        let started = std::time::Instant::now();
+        let session = super::claude_recorded_session_waiting(
+            &process,
+            grace,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        writer.join().unwrap();
+        assert_eq!(session.as_deref(), Some(UUID));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert!(started.elapsed() < grace);
+
+        let silent = tempfile::tempdir().unwrap();
+        let silent = silent.path().canonicalize().unwrap();
+        let (_child, old) = claude_like(&silent);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            super::claude_recorded_session_waiting(
+                &old,
+                std::time::Duration::ZERO,
+                std::time::Instant::now() + std::time::Duration::from_secs(60)
+            )
+            .unwrap(),
+            None,
+            "a process past the grace period is not waited for"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_half_written_record_is_read_again_until_the_deadline() {
+        let config = tempfile::tempdir().unwrap();
+        let config = config.path().canonicalize().unwrap();
+        let (_child, process) = claude_like(&config);
+        write_record(&config, &process, "{\"pid\": ");
+        let writer = {
+            let (config, process) = (config.clone(), process.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                write_record(&config, &process, &own_record(&process));
+            })
+        };
+        let session = super::claude_recorded_session_waiting(
+            &process,
+            std::time::Duration::from_secs(5),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        writer.join().unwrap();
+        assert_eq!(session.unwrap().as_deref(), Some(UUID));
+
+        write_record(&config, &process, "{\"pid\": ");
+        let started = std::time::Instant::now();
+        let error = super::claude_recorded_session_waiting(
+            &process,
+            std::time::Duration::ZERO,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("not a Claude session record"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_lock_waits_outlast_a_save_waiting_for_records() {
+        let config = |timeout_ms, settle_ms| Config {
+            timeout_ms,
+            settle_ms,
+            ..Config::default()
+        };
+        let wait = |c: &Config| crate::app::lock_wait(c);
+        let floor = super::CLAUDE_RECORD_BUDGET + std::time::Duration::from_millis(1500);
+        assert_eq!(wait(&Config::default()), floor);
+        assert_eq!(
+            wait(&config(3000, 0)),
+            floor,
+            "settle_ms 0 does not shorten it"
+        );
+        assert_eq!(wait(&config(10, 0)), floor);
+        assert_eq!(
+            wait(&config(20_000, 5_000)),
+            std::time::Duration::from_secs(25)
+        );
+        assert_eq!(
+            wait(&config(60_000, 60_000)),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn both_capture_attempts_share_one_record_deadline() {
+        let mut deadlines = Vec::new();
+        let mut warnings = vec!["kept".to_string()];
+        let captured = super::attempt_twice(
+            std::time::Duration::from_secs(4),
+            &mut warnings,
+            false,
+            |warnings, until| {
+                deadlines.push(until);
+                warnings.push(format!("attempt {}", deadlines.len()));
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok((deadlines.len() == 2).then_some("second"))
+            },
+        )
+        .unwrap();
+        assert_eq!(captured, "second");
+        assert_eq!(deadlines.len(), 2);
+        assert_eq!(
+            deadlines[0], deadlines[1],
+            "the second attempt gets no new budget"
+        );
+        assert_eq!(
+            warnings,
+            ["kept", "attempt 2"],
+            "the discarded attempt's warnings go"
+        );
+
+        let error =
+            super::attempt_twice(std::time::Duration::ZERO, &mut Vec::new(), true, |_, _| {
+                Ok(None::<()>)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("panes kept changing"));
+    }
+
+    #[test]
+    fn a_record_wait_ends_by_the_budget_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (_child, process) = claude_like(&dir);
+        let started = std::time::Instant::now();
+        let until = started + std::time::Duration::from_millis(200);
+        let session = super::claude_recorded_session_waiting(
+            &process,
+            std::time::Duration::from_secs(30),
+            until,
+        )
+        .unwrap();
+        assert_eq!(session, None);
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "{waited:?}"
+        );
+        assert!(waited < std::time::Duration::from_secs(2), "{waited:?}");
+    }
+
+    #[test]
+    fn a_whole_record_that_does_not_fit_ends_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (_child, process) = claude_like(&dir);
+        write_record(&dir, &process, "{\"pid\": \"not a number\"}");
+        let started = std::time::Instant::now();
+        let error = super::claude_recorded_session_waiting(
+            &process,
+            std::time::Duration::from_secs(30),
+            started + std::time::Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a Claude session record"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_error_that_cannot_clear_ends_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let (_child, process) = claude_like(&dir);
+        let mut record: serde_json::Value = serde_json::from_str(&own_record(&process)).unwrap();
+        record["sessionId"] = serde_json::json!("not-a-uuid");
+        write_record(&dir, &process, &record.to_string());
+        let started = std::time::Instant::now();
+        let error = super::claude_recorded_session_waiting(
+            &process,
+            std::time::Duration::from_secs(30),
+            started + std::time::Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("names no exact session"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_argv_that_names_the_session_does_not_wait_for_the_record() {
+        let config = tempfile::tempdir().unwrap();
+        let config = config.path().canonicalize().unwrap();
+        let (_child, process) = claude_like(&config);
+        let started = std::time::Instant::now();
+        let decided = super::unreported_agent_command(
+            &process,
+            &owned(&["claude", "--resume", UUID]),
+            std::time::Duration::from_secs(30),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(matches!(
+            decided,
+            super::Unreported::Known {
+                recorded: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn without_native_metadata_an_unknown_agent_session_is_not_a_failure() {
+        use super::{Unreported, unreported_agent_command};
+        let config = tempfile::tempdir().unwrap();
+        let config = config.path().canonicalize().unwrap();
+        let (_child, process) = claude_like(&config);
+        let decide = |argv: &[&str]| {
+            unreported_agent_command(
+                &process,
+                &owned(argv),
+                std::time::Duration::ZERO,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .unwrap()
+        };
+        let known = |argv: &[&str]| match decide(argv) {
+            Unreported::Known {
+                command,
+                recorded,
+                unnamed,
+                note,
+            } => (command, recorded, unnamed, note),
+            Unreported::Unidentified(reason) => panic!("{argv:?} not identified: {reason}"),
+        };
+        let session = |command: Option<CommandSpec>| match command {
+            Some(CommandSpec::Agent { session_id, .. }) => session_id,
+            other => panic!("not an agent: {other:?}"),
+        };
+
+        let Unreported::Unidentified(reason) = decide(&["claude"]) else {
+            panic!("a bare claude without its record is not identified");
+        };
+        assert!(reason.contains("claude session not identified"), "{reason}");
+        let Unreported::Unidentified(reason) = decide(&["codex"]) else {
+            panic!("a bare codex is not identified");
+        };
+        assert!(reason.contains("codex session not identified"), "{reason}");
+        let (command, recorded, unnamed, note) = known(&["codex", "resume", UUID]);
+        assert_eq!(
+            (session(command), recorded, unnamed, note),
+            (UUID.to_string(), false, false, None)
+        );
+        let (command, recorded, _, _) = known(&["sleep", "30"]);
+        assert!(matches!(command, Some(CommandSpec::Program { .. })) && !recorded);
+
+        write_record(&config, &process, &own_record(&process));
+        let other = "01234567-89ab-cdef-0123-456789abcdef";
+        let (command, recorded, unnamed, _) = known(&["claude"]);
+        assert_eq!(
+            (session(command), recorded, unnamed),
+            (UUID.to_string(), true, true)
+        );
+        let (command, recorded, unnamed, _) = known(&["claude", "--resume", other]);
+        assert_eq!(
+            (session(command), recorded, unnamed),
+            (UUID.to_string(), true, true),
+            "the record wins over a stale --resume, and its transcript must be checked"
+        );
+        let (command, recorded, unnamed, _) = known(&["claude", "--resume", UUID]);
+        assert_eq!(
+            (session(command), recorded, unnamed),
+            (UUID.to_string(), true, false)
+        );
+
+        write_record(&config, &process, "not json");
+        let Unreported::Unidentified(reason) = decide(&["claude"]) else {
+            panic!("an unreadable record identifies nothing");
+        };
+        assert!(reason.contains("not a Claude session record"), "{reason}");
+        let (command, recorded, _, note) = known(&["claude", "--resume", other]);
+        assert_eq!((session(command), recorded), (other.to_string(), false));
+        let note = note.expect("the unusable record is reported");
+        assert!(note.contains("not a Claude session record"), "{note}");
     }
 }

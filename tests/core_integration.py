@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -313,6 +314,19 @@ class Shell:
                     pass
             time.sleep(0.02)
         raise AssertionError(f"processes on {self.tty} survived SIGKILL")
+
+
+def sleeper(directory):
+    """A sleep whose environment revive can read, as it can a real agent's:
+    macOS hides the environment of its own platform binaries such as
+    /bin/sleep, and an ad-hoc signed copy is no platform binary."""
+    if sys.platform != "darwin":
+        return "/bin/sleep"
+    copy = Path(directory) / "agent-sleep"
+    shutil.copy("/bin/sleep", copy)
+    subprocess.run(["codesign", "--force", "--sign", "-", str(copy)], check=True,
+                   capture_output=True, timeout=30)
+    return str(copy)
 
 
 def pgrep(option, value):
@@ -643,6 +657,102 @@ class CoreHost(unittest.TestCase):
         self.assertEqual(second.foreground(), second.pid)
         self.assertEqual(fx.boots(), [])
         self.assertEqual(fx.core.sent, [])
+
+    def test_bare_agents_save_with_claudes_record_and_without_failing_the_save(self):
+        """herdr-core reports no agent sessions: a bare `claude` is saved with
+        the session its own record names, once it has written it (a save
+        right after the start waits), a bare `codex` without a command,
+        and neither stops the save (issue #1). Nor does a bare `claude` in
+        a profile revive cannot reproduce for its not yet written session."""
+        fx = self.fixture()
+        session = "3f2b8c1e-0000-4000-8000-000000000000"
+        fx.home.joinpath(".claude").mkdir()
+        # Like Claude, the record comes 1.5 s after the start, from a helper
+        # detached from the pane's foreground group.
+        record = ("import json, os, sys, time\n"
+                  "if os.fork():\n"
+                  "    os._exit(0)\n"
+                  "os.setsid()\n"
+                  "time.sleep(1.5)\n"
+                  "pid = int(sys.argv[1])\n"
+                  "start = domain = None\n"
+                  "if sys.platform.startswith('linux'):\n"
+                  "    stat = open(f'/proc/{pid}/stat').read()\n"
+                  "    start = stat.rsplit(') ', 1)[1].split()[19]\n"
+                  "    machine = open('/etc/machine-id').read().strip()\n"
+                  "    domain = f\"linux:{machine}:{os.readlink(f'/proc/{pid}/ns/pid')}\"\n"
+                  "with open(f'{sys.argv[2]}/{pid}.json', 'w') as f:\n"
+                  "    json.dump(dict(pid=pid, sessionId=sys.argv[3], startedAt=int(time.time() * 1000),\n"
+                  "                   procStart=start, pidDomain=domain, kind='interactive'), f)\n")
+        claude = fx.bin_dir / "claude"
+        claude.write_text("#!/bin/bash\n"
+                          "sessions=\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions\"\n"
+                          "mkdir -p \"$sessions\"\n"
+                          f"{sys.executable} -I -c {shlex.quote(record)} \"$$\" \"$sessions\" {session}\n"
+                          f"exec -a claude {sleeper(fx.root)} 600\n")
+        claude.chmod(0o755)
+        codex = fx.bin_dir / "codex"
+        codex.write_text(f"#!/bin/bash\nexec -a codex {sleeper(fx.root)} 600\n")
+        codex.chmod(0o755)
+        work_profile = fx.root / "claude-work"
+        work_profile.mkdir()
+        shells = {}
+        for address, program, env in (("t1", "claude", None), ("t2", "codex", None),
+                                      ("t3", "claude", dict(CLAUDE_CONFIG_DIR=str(work_profile)))):
+            shell = fx.start_shell(address, env)
+            shell.wait_output(PROMPT)
+            shell.type(program)
+            fx.wait_until(lambda: shell.foreground_jobs() == [[program, "600"]],
+                          what=f"{program} running")
+            shells[address] = shell
+        last = work_profile / "sessions" / f"{shells['t3'].foreground()}.json"
+        self.assertFalse(last.exists(), "the save must start before t3's record exists")
+        result = subprocess.run([str(BINARY), "--host", "core", "save"], env=fx.env(),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr + fx.describe())
+        self.assertIn(f"pane {SPACE}:pt2: codex session not identified", result.stderr)
+        self.assertIn("saved without a command", result.stderr)
+        panes = {p["pane_id"]: p for p in fx.latest()["panes"]}
+        agent = panes[f"{SPACE}:pt1"]["command"]
+        self.assertEqual((agent["kind"], agent["agent"], agent["session_id"]),
+                         ("agent", "claude", session), fx.describe())
+        self.assertIsNone(panes[f"{SPACE}:pt2"]["command"])
+        self.assertEqual(panes[f"{SPACE}:pt2"]["cwd"], str(fx.work))
+        self.assertIn(f"pane {SPACE}:pt3: claude session {session}: Claude configuration "
+                      "profile cannot be reproduced", result.stderr)
+        self.assertIsNone(panes[f"{SPACE}:pt3"]["command"])
+
+    def test_one_save_waits_for_claude_records_once_in_all(self):
+        """Two young `claude` panes that never write a record cost one
+        capture at most one record budget (4 s), not one per pane, so a save
+        holding the session lock ends before `init` and the hook's saves stop
+        waiting for it (5.5 s at least, whatever timeout_ms and settle_ms).
+        The second starts 3 s after the first: the budget ends the save about
+        4 s in, where its 5 s grace alone, or a budget per pane, would end it
+        about 5 s in."""
+        fx = self.fixture()
+        claude = fx.bin_dir / "claude"
+        claude.write_text(f"#!/bin/bash\nexec -a claude {sleeper(fx.root)} 600\n")
+        claude.chmod(0o755)
+        fx.home.joinpath(".claude").mkdir()
+        shells = {address: fx.start_shell(address) for address in ("t1", "t2")}
+        for address, shell in shells.items():
+            shell.wait_output(PROMPT)
+            if address == "t2":
+                time.sleep(3)
+            shell.type("claude")
+            fx.wait_until(lambda: shell.foreground_jobs() == [["claude", "600"]],
+                          what=f"claude running in {address}")
+        started = time.monotonic()
+        result = subprocess.run([str(BINARY), "--host", "core", "save"], env=fx.env(),
+                                capture_output=True, text=True, timeout=15)
+        took = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr + fx.describe())
+        self.assertGreaterEqual(took, 3.6, "the save gives up before its budget")
+        self.assertLess(took, 4.6, f"waited {took:.1f} s: grace alone or more than one budget")
+        for address in ("t1", "t2"):
+            self.assertIn(f"pane {SPACE}:p{address}: claude session not identified", result.stderr)
+        self.assertEqual([p["command"] for p in fx.latest()["panes"]], [None, None])
 
     def test_restore_types_through_terminal_send(self):
         fx = self.fixture(auto_save=True)

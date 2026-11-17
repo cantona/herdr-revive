@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- On the desktop app (`--host core`), a pane running a bare `claude` or
+  `codex` no longer fails every save with "agent session metadata did not
+  arrive" (#1). herdr-core reports no agent sessions, so for Claude, Revive
+  now reads Claude Code's own record of the running process
+  (`sessions/<pid>.json` in its profile) and checks that this very process
+  wrote it. An agent that still cannot be identified, such as a bare
+  `codex`, is saved without a command, with a warning, and the other panes
+  still save; so is a bare `claude` whose session has no transcript yet in a
+  profile the save cannot reproduce. `migrate --to tui` follows: a space with
+  such a pane is now copied, the pane as a shell in its cwd with a warning in
+  the plan, where it used to be skipped as uncapturable.
+
 ## 0.3.0 — 2026-11-10 (prerelease)
 
 - `herdr-revive migrate --to app` copies a herdr TUI session into Herdr
