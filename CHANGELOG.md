@@ -1,11 +1,17 @@
 # Changelog
 
-## Unreleased
+What changed in each release of herdr-revive. Every release so far is a
+prerelease.
 
+## [Unreleased]
+
+### Changed
 - herdr-revive is now licensed under the Apache License 2.0 instead of MIT.
   Every source file carries `SPDX-FileCopyrightText` and
   `SPDX-License-Identifier: Apache-2.0` lines.
   Releases up to 0.3.0 remain available under MIT.
+
+### Fixed
 - On the desktop app (`--host core`), a pane running a bare `claude` or
   `codex` no longer fails every save with "agent session metadata did not
   arrive" (#1). herdr-core reports no agent sessions, so for Claude, Revive
@@ -18,8 +24,9 @@
   such a pane is now copied, the pane as a shell in its cwd with a warning in
   the plan, where it used to be skipped as uncapturable.
 
-## 0.3.0 — 2026-11-10 (prerelease)
+## [0.3.0] - 2026-11-10
 
+### Added
 - `herdr-revive migrate --to app` copies a herdr TUI session into Herdr
   desktop app spaces, and `--to tui` copies the app's spaces into a TUI
   session: workspaces or spaces and tabs with their names, the split
@@ -80,20 +87,23 @@
   names the folder. A space copied into two TUI sessions is recorded for
   each. An unnamed app space takes the
   window's name for it, else its folder's name.
-- `--host core save` and the core relaunch now record an idle shell pane's
-  cwd as the folder its shell is in, which herdr-core reads from the
-  foreground process, instead of the folder the terminal started in. Where
-  core cannot read it, or the folder it names is gone, the start folder is
-  used as before; a folder removed and made again at the same path counts
-  as there.
 - The app dialog gets a Migrate section: a machine picker and "Copy TUI
   session here" / "Copy app spaces to TUI", each showing the plan before it
   copies; "Copy N" copies only the sources that plan showed. herdr-revive
   started from the dialog now also finds `herdr`, `hc` and `herdr-app` in
   `~/.local/bin` and `~/.cargo/bin`.
 
-## 0.2.1 — 2026-11-09 (prerelease)
+### Fixed
+- `--host core save` and the core relaunch now record an idle shell pane's
+  cwd as the folder its shell is in, which herdr-core reads from the
+  foreground process, instead of the folder the terminal started in. Where
+  core cannot read it, or the folder it names is gone, the start folder is
+  used as before; a folder removed and made again at the same path counts
+  as there.
 
+## [0.2.1] - 2026-11-09
+
+### Added
 - `herdr-revive install` sets up the Herdr desktop app in one step: it
   writes the dialog mod (`main.js`, `mod.json`, built into the binary) to
   `~/.config/herdr-app/mods/herdr-revive` (or under `HERDR_APP_HOME` or
@@ -111,19 +121,17 @@
   refused. `herdr-revive uninstall` removes what `install` added, plus the
   editor files the app writes into the mod folder, and nothing else. Both
   imply `--host core`.
+
+### Changed
 - Bare `install` used to print the rc dry run as JSON; it now prints the
   plan and, without a terminal or `--yes`, exits 2 without changing
   anything. `install --write` and `install --remove` still apply, as
   `install --yes` and `uninstall --yes`, and print the plan as text instead
   of JSON. The dialog's Setup hint now reads `herdr-revive install`.
 
-## 0.2.0 — 2026-11-09 (prerelease)
+## [0.2.0] - 2026-11-09
 
-- A pane whose foreground program is protected from inspection (setuid, such
-  as Apple's `top` or `sudo`) no longer fails the whole save. It is saved with
-  the pane's cwd and the program's full command line on Linux; on macOS, the
-  bare program name, or the line the bash hook saw the shell run when it is
-  plain words. A warning names the pane.
+### Added
 - Run against the Herdr desktop app (herdr-core) with `--host core`: the
   same capture, policy, snapshots, journal and recovery over a second host.
   A bash hook saves when an allowlisted program starts or ends in a pane; a
@@ -133,13 +141,23 @@
   and `status`, and a dialog mod under `mods/herdr-revive` (`RECIPE.md`,
   `keys.json` binding `ctrl-alt-r`, `cmd-alt-r` on macOS). Named spaces and `restore --recreate`
   stay TUI-only; `event` on the app only saves.
+
+### Changed
 - Direct invocations outside the Herdr plugin environment, except `config`,
   now need `--host herdr|core` (or `HERDR_REVIVE_HOST`); before, they assumed
   the TUI host. The plugin manifest and scripts pass `--host herdr`, so the plugin's
   actions and events are unchanged.
 
-## 0.1.6 — 2026-10-15 (prerelease)
+### Fixed
+- A pane whose foreground program is protected from inspection (setuid, such
+  as Apple's `top` or `sudo`) no longer fails the whole save. It is saved with
+  the pane's cwd and the program's full command line on Linux; on macOS, the
+  bare program name, or the line the bash hook saw the shell run when it is
+  plain words. A warning names the pane.
 
+## [0.1.6] - 2026-10-15
+
+### Fixed
 - Save Claude Code panes that reopened a background session as
   `claude attach <short id>`. Capture now looks the id up in
   `claude agents --json --all`, using the pane's `CLAUDE_CONFIG_DIR`, `HOME`
@@ -149,8 +167,9 @@
   hooks report to the pane that started it. An attach that cannot be resolved
   falls back to Herdr's record when there is one.
 
-## 0.1.5 — 2026-10-07 (prerelease)
+## [0.1.5] - 2026-10-07
 
+### Fixed
 - Save panes of agents Revive cannot resume as ordinary programs instead of
   failing the save. A pane reporting an agent such as `annotator` (the
   herdr-file-annotator review pane), opencode or pi no longer blocks autosave;
@@ -159,56 +178,69 @@
 - Keep status events of non-resumable agents debounced, so they no longer write
   a snapshot per status change and rotate retained snapshots out.
 
-## 0.1.4 — 2026-10-07 (prerelease)
+## [0.1.4] - 2026-10-07
 
+### Fixed
 - Accept every Herdr release from `min_herdr_version` (0.9.1) onward. The
   runtime no longer refuses hosts other than 0.9.1 / protocol 22; on Herdr
   0.9.3 that check failed startup and lifecycle events, so autosave and the
   startup restore stopped without a visible error. Herdr enforces the minimum
   version at install and link time.
 
-## 0.1.3 — 2026-09-19 (prerelease)
+## [0.1.3] - 2026-09-19
 
-- Keep exact agent sessions across automatic shell-state saves, while manual
-  saves can intentionally clear them. Retry delayed native metadata, refresh
-  capture after waiting, and avoid dropping contending lifecycle events silently.
-- Bypass debounce for agent detection and changed session references; preserve
-  the ordinary debounced-event and exact-ID capture fast paths.
-- Refuse stale native references that conflict with a newly detected explicit
-  resume until matching metadata arrives; preserve in-process session switching.
+### Added
 - Preserve untouched bare Claude sessions with their assigned UUID by
   relaunching them with `--session-id`; switch to exact `--resume` as soon as
   Claude has written a nonempty transcript.
-- Keep `CLAUDE_CONFIG_DIR` unset for standard Claude and preserve its captured
-  `HOME`; retain explicitly selected profiles for launchers such as `claude-local`.
+- Add empty-session transition, legacy-snapshot, automatic-startup, regression,
+  and paired pre-fix v0.1.3 performance coverage on macOS and Linux.
+
+### Changed
+- Bypass debounce for agent detection and changed session references; preserve
+  the ordinary debounced-event and exact-ID capture fast paths.
 - Resolve the active Claude profile from the captured process environment and
   check the canonical project transcript directly on ordinary paths, with a
   bounded exhaustive fallback for continuation, explicit session-ID selection,
   and unusual path cases.
-- Resume exact saved agent sessions when Herdr retains stale agent metadata
-  after a restart. The live process tree remains authoritative, so panes with
-  real foreground or background work are still skipped.
-- Add empty-session transition, legacy-snapshot, automatic-startup, regression,
-  and paired pre-fix v0.1.3 performance coverage on macOS and Linux.
 - Omit redundant resume-mode fields and reuse encoded snapshot bytes for
   history/latest writes, preserving archive IDs and synchronization guarantees.
 
-## 0.1.2 — 2026-09-19 (prerelease)
+### Fixed
+- Keep exact agent sessions across automatic shell-state saves, while manual
+  saves can intentionally clear them. Retry delayed native metadata, refresh
+  capture after waiting, and avoid dropping contending lifecycle events silently.
+- Refuse stale native references that conflict with a newly detected explicit
+  resume until matching metadata arrives; preserve in-process session switching.
+- Keep `CLAUDE_CONFIG_DIR` unset for standard Claude and preserve its captured
+  `HOME`; retain explicitly selected profiles for launchers such as `claude-local`.
+- Resume exact saved agent sessions when Herdr retains stale agent metadata
+  after a restart. The live process tree remains authoritative, so panes with
+  real foreground or background work are still skipped.
 
+## [0.1.2] - 2026-09-19
+
+### Added
+- Add Linux and macOS live-session, restart, security, regression, and
+  before/after performance validation for the affected paths.
+
+### Fixed
 - Preserve exact bare-agent sessions when an agent internally redirects
   stdout or stderr to `/dev/null`, including Codex on macOS.
 - Accept Git's single plain system-shell wrapper around system `less` or
   `more`, so an active pager in another pane cannot block atomic autosave.
   Shell expansions, operators, pipelines, queued commands, and redirected
   pager output remain refused.
-- Add Linux and macOS live-session, restart, security, regression, and
-  before/after performance validation for the affected paths.
 
-## 0.1.1 — 2026-09-19 (prerelease)
+## [0.1.1] - 2026-09-19
 
+### Added
 - Native macOS process/argv/cwd and launcher-environment capture, terminal and
   null-stream validation, OpenSSH output recovery, and Apple Git pager support.
 - Authenticated macOS server generation and kqueue autosave shutdown handling.
+- Portable native runtime tests and real mixed-pane performance measurements.
+
+### Changed
 - Split Linux and macOS adapters into `src/platform/linux.rs` and `macos.rs`.
   Darwin FFI exceptions are limited to individual checked calls; other code
   continues to deny unsafe code.
@@ -216,23 +248,19 @@
   use direct child enumeration on macOS and per-thread child lists on Linux,
   with the original Linux scan retained as a fallback. Newly created panes
   retry transient shell metadata reads within their existing readiness deadline.
-- Portable native runtime tests and real mixed-pane performance measurements.
 
-## 0.1.0 — 2026-09-18 (prerelease)
+## [0.1.0] - 2026-09-18
 
+### Added
 - Documented and tested the required handoff from Herdr's native agent restore
   to Revive. Native restore generates canonical `claude` commands and cannot
   preserve `claude-local`, even when the Revive snapshot is correct.
-
 - Buffered process reads and JSON output; busy restore skips redundant whole-host
   process scans while keeping candidate idle-shell checks.
-- Corrected package, executable and plugin identity to `herdr-revive`, preserving
-  existing snapshot reads and boot claims across the local rename.
 - Environment-selected custom agent launchers preserve exec-style wrappers such
   as `claude-local` with exact session IDs and current configuration checks.
 - Real `top`, `htop`, `journalctl` and `tail` restoration coverage; Git's internal
   terminal pager is captured as the original Git command.
-
 - Independent MIT-licensed Rust implementation and plugin identity.
 - Linux process/argv capture, versioned native snapshots, retention and explicit
   reusable global named spaces and optional mapping imports.
@@ -253,6 +281,22 @@
 - Linux fixtures, real-shell argument tests, disposable host lifecycle checks,
   dependency notices and warm benchmark harness.
 
+### Fixed
+- Corrected package, executable and plugin identity to `herdr-revive`, preserving
+  existing snapshot reads and boot claims across the local rename.
+
 This Linux prerelease includes automated runtime and installation checks.
 Power-loss qualification, full-session rollback observation, macOS and Windows
 remain follow-up work; see [validation](docs/VALIDATION.md).
+
+[Unreleased]: https://github.com/cantona/herdr-revive/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/cantona/herdr-revive/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/cantona/herdr-revive/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/cantona/herdr-revive/compare/v0.1.6...v0.2.0
+[0.1.6]: https://github.com/cantona/herdr-revive/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/cantona/herdr-revive/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/cantona/herdr-revive/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/cantona/herdr-revive/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/cantona/herdr-revive/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/cantona/herdr-revive/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/cantona/herdr-revive/releases/tag/v0.1.0
