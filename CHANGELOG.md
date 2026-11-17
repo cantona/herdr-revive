@@ -1,7 +1,7 @@
 # Changelog
 
-What changed in each release of herdr-revive. Every release so far is a
-prerelease.
+What changed in each release of herdr-revive. Releases up to 0.3.0 were
+prereleases; 0.3.1 is the first full release.
 
 ## [0.3.1] - 2026-11-17
 

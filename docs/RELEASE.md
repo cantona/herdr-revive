@@ -1,6 +1,6 @@
 # Release, migration and rollback
 
-Version 0.3.1 is a Linux and macOS prerelease of `cantona/herdr-revive`, licensed
+Version 0.3.1 is a Linux and macOS release of `cantona/herdr-revive`, licensed
 under Apache-2.0. It is built from source during installation. The manifest advertises
 both platforms. See [macOS and Linux regression validation](MACOS.md). Windows
 remains planned.
