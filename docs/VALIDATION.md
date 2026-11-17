@@ -118,7 +118,8 @@ in the raw measurements.
   recorded separately above.
 
 There is no legacy importer or automatic migration. Native formats and explicit
-migration instructions are described in the README.
+migration instructions are described in the
+[guide](GUIDE.md#import-and-migration).
 
 ## Launchers and interactive programs
 
@@ -159,6 +160,7 @@ Revive restores the wrapper, exact ID and selected environment, recaptures it,
 and refuses automatic replay in the same boot. The test uses a harmless fixture
 executable and never connects to an agent service.
 
-The required configuration handoff is documented in the README: disable Herdr's
+The required configuration handoff is documented in the
+[guide](GUIDE.md#configuration): disable Herdr's
 native agent resume while keeping Revive's automatic restore and agent resume
 on. Existing sessions need their own snapshots before relying on this handoff.

@@ -21,7 +21,7 @@ managed installation. Keep config and state in the host-provided directories,
 not the replaceable plugin checkout. A locally linked plugin must be unlinked
 before installing a managed copy.
 
-Run the README verification commands from a fresh tree. Record the compiler,
+Run the [verification commands](GUIDE.md#verification) from a fresh tree. Record the compiler,
 target triple, lockfile digest and release binary digest. The lockfile pins
 dependency resolution; byte-identical binaries across compilers, build paths
 and linkers are not claimed. The release source includes third-party license
@@ -76,7 +76,8 @@ Keep Revive's `auto_restore` and `resume_agents` enabled in the plugin config.
 The native path uses canonical agent names and loses custom launchers such as
 `claude-local`. The host setting applies to all sessions sharing that config;
 a session without a Revive snapshot will not gain one through this setting.
-Configure custom launcher selectors before capture, as shown in the README.
+Configure custom launcher selectors before capture, as shown in the
+[guide](GUIDE.md#configuration).
 
 Update save/restore bindings to the IDs in [the feature matrix](PARITY.md).
 Verify save, preview and the intended restore in one session before relying on

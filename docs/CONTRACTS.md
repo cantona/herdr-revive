@@ -242,7 +242,7 @@ preserves the PTY lifetime during native reconstruction. Process identity checks
 guard PID reuse, but capture is not an atomic
 snapshot of all OS processes. Busy detection includes background descendants.
 Shell-readiness and check/run races remain the host limitations described in
-the README and reproduced in the integration suite.
+the [guide](GUIDE.md#recovery-and-safety-limits) and reproduced in the integration suite.
 
 OpenSSH session stdout is separate from fd 1: after duplicating its streams,
 OpenSSH redirects fd 1 internally. Capture verifies the process executable
