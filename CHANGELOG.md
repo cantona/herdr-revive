@@ -10,6 +10,11 @@ prerelease.
   Every source file carries `SPDX-FileCopyrightText` and
   `SPDX-License-Identifier: Apache-2.0` lines.
   Releases up to 0.3.0 remain available under MIT.
+- On the desktop app, `init` and the hook's saves now wait at least 5.5 s
+  for a session lock another operation holds, whatever `timeout_ms` and
+  `settle_ms` are, so they outlast a save that waits for Claude's record.
+- The README is now an overview with a benchmark chart; the full reference
+  moved to `docs/GUIDE.md`.
 
 ### Fixed
 - On the desktop app (`--host core`), a pane running a bare `claude` or
@@ -17,12 +22,14 @@ prerelease.
   arrive" (#1). herdr-core reports no agent sessions, so for Claude, Revive
   now reads Claude Code's own record of the running process
   (`sessions/<pid>.json` in its profile) and checks that this very process
-  wrote it. An agent that still cannot be identified, such as a bare
-  `codex`, is saved without a command, with a warning, and the other panes
-  still save; so is a bare `claude` whose session has no transcript yet in a
-  profile the save cannot reproduce. `migrate --to tui` follows: a space with
-  such a pane is now copied, the pane as a shell in its cwd with a warning in
-  the plan, where it used to be skipped as uncapturable.
+  wrote it. Claude writes it up to a few seconds after it starts, so a save
+  waits up to 4 s in all for a young Claude's record. An agent that still
+  cannot be identified, such as a bare `codex`, is saved without a command,
+  with a warning, and the other panes still save; so is a bare `claude`
+  whose session has no transcript yet in a profile the save cannot
+  reproduce. `migrate --to tui` follows: a space with such a pane is now
+  copied, the pane as a shell in its cwd with a warning in the plan, where
+  it used to be skipped as uncapturable.
 
 ## [0.3.0] - 2026-11-10
 
